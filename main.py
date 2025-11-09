@@ -1,55 +1,19 @@
-import requests
+import argparse
+import sys
+
 import pandas as pd
-from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 
-def fetch_klines(symbol='BTCUSDT', interval='1h', limit=1000):
-    """
-    Fetches historical k-line (candlestick) data from Binance.
-    """
-    url = 'https://api.binance.com/api/v3/klines'
-    params = {
-        'symbol': symbol,
-        'interval': interval,
-        'limit': limit
-    }
-    
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()  # Raises an exception for bad responses (4xx or 5xx)
-        data = response.json()
-        
-        # Define the column names as per Binance API documentation
-        columns = [
-            'open_time', 'open', 'high', 'low', 'close', 'volume', 
-            'close_time', 'quote_asset_volume', 'number_of_trades', 
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ]
-        
-        df = pd.DataFrame(data, columns=columns)
-        
-        # Convert timestamp to datetime and select relevant columns
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        
-        # Convert relevant columns to numeric types for calculations
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-        
-        # Return a clean DataFrame
-        return df[['open_time', 'open', 'high', 'low', 'close', 'volume']]
+from binance import fetch_klines
+from rostoo import RoostooClient
 
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred fetching data: {e}")
-        return None
-
-# --- NEW FUNCTION: Replaced with loop-based simulation ---
 def backtest_ma_crossover(df, 
                           short_window=10, 
                           long_window=50, 
                           trading_fee=0.001, 
                           initial_capital=10000,
-                          trade_amount=10000): # <-- Added fixed trade amount
+                          trade_amount=10000):
     """
     Backtests a Moving Average Crossover strategy, NOW WITH:
     - Loop-based simulation (required for stops)
@@ -59,8 +23,6 @@ def backtest_ma_crossover(df,
         print("DataFrame is invalid.")
         return None
 
-    print(f"\nRunning backtest with short={short_window}, long={long_window}, fee={trading_fee}...")
-    
     data = df.copy()
     # Use EWM as in your original file
     data['short_ma'] = data['close'].ewm(span=short_window, adjust=False).mean()
@@ -197,14 +159,10 @@ def backtest_ma_crossover(df,
     print(f"Period: {data['open_time'].iloc[0]} to {data['open_time'].iloc[-1]}")
     print(f"Total Strategy Return: {total_return:.2%}")
     print(f"Total Trades: {total_trades}")
-    print("--- Risk & Return Metrics ---")
-    print(f"Annualized Return: {mean_return_hourly * hours_in_year:.2%}")
+    print(f"Annualized Return (approx): {(mean_return_hourly * hours_in_year):.2%}")
     print(f"Annualized Volatility: {annualized_std_dev:.2%}")
     print(f"Max Drawdown: {max_drawdown:.2%}")
-    print("--- Ratios ---")
-    print(f"Annualized Sharpe Ratio: {sharpe_ratio:.2f}")
-    print(f"Sortino Ratio: {sortino_ratio:.2f}")
-    print(f"Calmar Ratio: {calmar_ratio:.2f}")
+    print(f"Sharpe Ratio: {sharpe_ratio:.2f}, Sortino: {sortino_ratio:.2f}, Calmar: {calmar_ratio:.2f}")
     
     return data
 
@@ -257,23 +215,51 @@ def visualize_backtest(df):
     plt.show()
 
 # Main Execution
-if _name_ == "_main_":
-    print("Fetching historical data for backtesting...")
-    historical_data = fetch_klines(
-        symbol='BTCUSDT', 
-        interval='1h', 
-        limit=500) # Using 500 to match your file
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run backtest or deploy (Roostoo)")
+    # deploy accepts two parameters: API_KEY and API_SECRET
+    parser.add_argument('--deploy', nargs=2, metavar=('API_KEY', 'API_SECRET'),
+                        help="Provide API_KEY and API_SECRET to run deploy mode. Example: --deploy KEY SECRET")
+    parser.add_argument('--limit', type=int, default=500, help="Kline fetch limit")
+    parser.add_argument('--short', type=int, default=5, help="Short EMA window")
+    parser.add_argument('--long', type=int, default=10, help="Long EMA window")
+    args = parser.parse_args()
 
-    if historical_data is not None:
-        # Run the backtest
-        backtest_results = backtest_ma_crossover(historical_data,   
-                                                 short_window=5, 
-                                                 long_window=10, 
-                                                 trading_fee=0.0001,
-                                                 initial_capital=50000,
-                                                 trade_amount=10000 # <-- Added fixed trade amount
-                                                 )
-        
-        # Visualize the results
-        if backtest_results is not None:
-            visualize_backtest(backtest_results)
+    if args.deploy:
+        api_key, secret_key = args.deploy[0], args.deploy[1]
+        print("Roostoo deployment selected (credentials provided via CLI).")
+
+        client = RoostooClient(api_key, secret_key)
+
+        try:
+            print("\n--- Server Time ---")
+            print(client.check_server_time())
+        except Exception as e:
+            print(f"Server time error: {e}")
+
+        try:
+            print("\n--- Exchange Info ---")
+            info = client.get_exchange_info()
+            print(info.get('TradePairs', {}) if isinstance(info, dict) else info)
+        except Exception as e:
+            print(f"Exchange info error: {e}")
+
+        try:
+            print("\n--- Balance ---")
+            print(client.get_balance())
+        except Exception as e:
+            print(f"Balance error: {e}")
+
+    else:
+        print("Fetching historical data for backtesting...")
+        historical_data = fetch_klines(symbol='BTCUSDT', interval='1h', limit=args.limit)
+
+        if historical_data is not None:
+            backtest_results = backtest_ma_crossover(historical_data,
+                                                     short_window=args.short,
+                                                     long_window=args.long,
+                                                     trading_fee=0.0001,
+                                                     initial_capital=50000,
+                                                     trade_amount=10000)
+            if backtest_results is not None:
+                visualize_backtest(backtest_results)
