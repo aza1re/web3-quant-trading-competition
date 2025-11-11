@@ -7,9 +7,6 @@ python3 btc_converted/main.py --source binance --symbol BTCUSDT --interval 1h --
 
 set -euo pipefail
 
-# Repo root (one level up from run/)
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-
 # Config — edit or export before running
 PY="${PY:-python3}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
@@ -24,31 +21,6 @@ FORCE="${FORCE:-0}"              # set to 1 to actually submit live orders
 ROOSTOO_API_KEY="${ROOSTOO_API_KEY:-}"
 ROOSTOO_API_SECRET="${ROOSTOO_API_SECRET:-}"
 HORUS_API_KEY="${HORUS_API_KEY:-}"
-
-LOGDIR="${LOGDIR:-/tmp/bot_logs}"
-mkdir -p "$LOGDIR"
-TS="$(date +%Y%m%d_%H%M%S)"
-LOGFILE="$LOGDIR/btc_run_${TS}.log"
-
-# Dependency check: skip install if marker exists
-DEPS_MARKER="$REPO_ROOT/.deps_ok"
-if [ -f "$DEPS_MARKER" ]; then
-    echo "Dependencies previously installed (marker: $DEPS_MARKER). Skipping pip install."
-else
-    echo "Installing Python dependencies (pip). This will install into the user's python environment."
-    # Use pip via selected python binary; install --user to avoid requiring sudo.
-    "$PY" -m pip install --upgrade pip setuptools wheel
-    if [ -f "$REPO_ROOT/requirements.txt" ]; then
-        # --no-warn-script-location reduces noise when using --user
-        "$PY" -m pip install --upgrade -r "$REPO_ROOT/requirements.txt" --user --no-warn-script-location
-        # mark successful install
-        touch "$DEPS_MARKER"
-        echo "Dependencies installed and marker created: $DEPS_MARKER"
-    else
-        echo "requirements.txt not found at $REPO_ROOT/requirements.txt. Aborting."
-        exit 2
-    fi
-fi
 
 # Build command
 CMD=( "$PY" "$REPO_ROOT/btc_converted/main.py" --symbol "$SYMBOL" --interval "$INTERVAL" --source "$SOURCE" --capital "$CAPITAL" --risk-mult "$RISK_MULT" --allocation "$ALLOCATION" )
@@ -90,11 +62,6 @@ if [ "$DEPLOY" = "1" ]; then
         fi
         sleep "$INTERVAL_SEC"
     done
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DEPLOY initial check complete — bot running in background (PID $BOT_PID)."
-    echo "Tailing log (press Ctrl-C to stop): $LOGFILE"
-    # leave bot running, tail the logfile for operator convenience
-    tail -n +1 -f "$LOGFILE"
 else
     # Backtest mode: include limit and apikey for horus if requested
     CMD+=( --limit "$LIMIT" )
