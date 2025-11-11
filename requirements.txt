@@ -1,35 +1,13 @@
-cachetools==6.2.1
-certifi==2025.10.5
-charset-normalizer==3.4.4
-contourpy @ file:///C:/b/abs_f2u2o_8s9g/croot/contourpy_1732540071787/work
-cycler @ file:///tmp/build/80754af9/cycler_1637851556182/work
-fonttools @ file:///C:/miniconda3/conda-bld/fonttools_1759754890124/work
-google-auth-oauthlib==1.2.3
-idna==3.11
-kiwisolver @ file:///C:/b/abs_faf90xet7a/croot/kiwisolver_1737040915779/work
-matplotlib==3.10.6
-mkl-service==2.5.2
-mkl_fft @ file:///C:/miniconda3/conda-bld/mkl_fft_1761592916781/work
-mkl_random @ file:///C:/miniconda3/conda-bld/mkl_random_1761593076691/work
-numpy==2.3.3
-oauthlib==3.3.1
-packaging @ file:///C:/miniconda3/conda-bld/packaging_1761049099114/work
-pandas==2.3.3
-pillow @ file:///C:/b/abs_b50vowcrzo/croot/pillow_1738010273782/work
-pyasn1==0.6.1
-pyasn1_modules==0.4.2
-pyparsing @ file:///C:/Users/dev-admin/buildout/croot/pyparsing_1735861809022/work
-PyQt6==6.9.1
-PyQt6_sip @ file:///C:/miniconda3/conda-bld/pyqt-split_1757511039072/work/pyqt_sip
-python-dateutil @ file:///C:/Users/dev-admin/perseverance-python-buildout/croot/python-dateutil_1729038406576/work
-pytz==2025.2
-requests==2.32.5
-requests-oauthlib==2.0.0
-rsa==4.9.1
-setuptools==80.9.0
-sip @ file:///C:/b/abs_f6ow8vlbb7/croot/sip_1756224172742/work
-six @ file:///C:/b/abs_149wuyuo1o/croot/six_1744271521515/work
-tornado @ file:///C:/b/abs_7dzpc171lf/croot/tornado_1748956950306/work
-tzdata==2025.2
-urllib3==2.5.0
-wheel==0.45.1
+aiohttp>=3.8.0
+argparse
+certifi
+chardet
+matplotlib>=3.6
+numpy>=1.24
+pandas>=2.0
+python-dateutil
+pytz
+requests>=2.28
+scikit-learn>=1.2
+xgboost>=1.7 
+joblib
