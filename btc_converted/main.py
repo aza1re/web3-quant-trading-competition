@@ -768,6 +768,43 @@ def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET',
         raise last_exc
     raise RuntimeError("Unable to call client.place_order with tested signatures")
 
+# --- Exchange sizing helpers (step sizes + min notional) ---
+_STEP_SIZE = {
+    # symbols
+    "ETHUSDT": 0.001,
+    "TRXUSDT": 1.0,    # set to 0.1 if your venue allows fractional TRX
+    # pairs
+    "ETH/USD": 0.001,
+    "TRX/USD": 1.0,
+}
+_MIN_NOTIONAL = {
+    "ETHUSDT": 10.0,
+    "TRXUSDT": 10.0,
+    "ETH/USD": 10.0,
+    "TRX/USD": 10.0,
+}
+
+def _qty_step(symbol_or_pair: str) -> float:
+    return float(_STEP_SIZE.get((symbol_or_pair or "").upper(), 0.000001))
+
+def _min_notional_usd(symbol_or_pair: str) -> float:
+    return float(_MIN_NOTIONAL.get((symbol_or_pair or "").upper(), 10.0))
+
+def _round_to_step(symbol_or_pair: str, qty: float) -> float:
+    step = _qty_step(symbol_or_pair)
+    if qty is None or qty <= 0 or step <= 0:
+        return 0.0
+    return math.floor(qty / step) * step
+
+def _ceil_to_step(symbol_or_pair: str, qty: float) -> float:
+    step = _qty_step(symbol_or_pair)
+    if qty is None or qty <= 0 or step <= 0:
+        return 0.0
+    return math.ceil(qty / step) * step
+
+def _round_qty(symbol_or_pair: str, qty: float) -> float:
+    return _round_to_step(symbol_or_pair, qty)
+
 # --- new helpers: summarize order responses and print runtime status ---
 def _summarize_order_resp(resp):
     """Return short string summary for rostoo order/place/query responses."""
