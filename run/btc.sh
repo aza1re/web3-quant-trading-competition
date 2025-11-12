@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # CONFIG — edit or export before running
-PY="${PY:-python}"
+PY="${PY:-python3}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
 INTERVAL="${INTERVAL:-1h}"       # 15m | 1h | 1d
 SOURCE="${SOURCE:-binance}"      # binance | horus (used for backtests only)
