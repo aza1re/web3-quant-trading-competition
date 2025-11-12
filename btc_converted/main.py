@@ -300,11 +300,13 @@ def run_live(symbol: str,
                     try:
                         resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
                         print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
+                        _print_raw_resp(resp_buy, "initial-buy")
                     except Exception as e:
                         print("[INITIAL-TEST] BUY failed:", e)
                     try:
                         resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
                         print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
+                        _print_raw_resp(resp_sell, "initial-sell")
                     except Exception as e:
                         print("[INITIAL-TEST] SELL failed:", e)
                 else:
@@ -358,6 +360,7 @@ def run_live(symbol: str,
                             resp = _place_order_safe(client, pair, "BUY", qty, order_type='MARKET')
                             last_order_resp = resp
                             print("Order resp:", _summarize_order_resp(resp))
+                            _print_raw_resp(resp, "live-buy")
                         except Exception as e:
                             last_order_resp = {"error": str(e)}
                             print("Order failed:", e)
@@ -376,6 +379,7 @@ def run_live(symbol: str,
                             resp = _place_order_safe(client, pair, "SELL", qty, order_type='MARKET')
                             last_order_resp = resp
                             print("Order resp:", _summarize_order_resp(resp))
+                            _print_raw_resp(resp, "live-sell")
                         except Exception as e:
                             last_order_resp = {"error": str(e)}
                             print("Order failed:", e)
@@ -466,6 +470,20 @@ def _summarize_order_resp(resp):
         return str(resp)
     except Exception:
         return repr(resp)
+
+def _print_raw_resp(resp, label="raw"):
+    """Print the raw API response (safe JSON dump or repr) for debugging."""
+    try:
+        if resp is None:
+            print(f"[API {label}] None")
+            return
+        if isinstance(resp, (str, int, float)):
+            print(f"[API {label}] {resp}")
+            return
+        # attempt JSON dump, truncate long output
+        print(f"[API {label}] {json.dumps(resp, default=str)[:8000]}")
+    except Exception:
+        print(f"[API {label}] repr:", repr(resp))
 
 def _print_status(port: 'SimplePortfolio', pair: str, last_signal, last_order_resp, verbose: bool=False):
     """Print compact bot status line to terminal."""
