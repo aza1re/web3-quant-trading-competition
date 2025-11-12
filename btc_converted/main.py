@@ -494,42 +494,45 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
     # live portfolio tracking (local)
     port = SimplePortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
 
-    # --- Initial dry-test trade (run once, immediate) ---
-    try:
-        init_price = fetch_roostoo_ticker(pair)
-    except Exception:
-        init_price = None
-
-    if init_price is not None:
-        # compute a tiny test qty (cap absolute test qty to a small value)
+    # --- Optional initial dry-test trade (run once, immediate) ---
+    if do_check:
         try:
-            test_qty = min((port.portfolio_value(init_price) * (alloc or 0.01) * risk_mult) / init_price, 0.001)
-            test_qty = float(max(0.0, test_qty))
+            init_price = fetch_roostoo_ticker(pair)
         except Exception:
-            test_qty = 0.0
+            init_price = None
 
-        if test_qty <= 0:
-            print("Initial dry-check: computed zero test qty, skipping test trade.")
-        else:
-            mode = "EXECUTING" if force else "SIMULATING (dry-run)"
-            print(f"[INITIAL-TEST] {mode} test trade: BUY {symbol} qty={test_qty:.8f} price={init_price:.2f}")
-            if force:
-                # execute a quick buy then sell to verify order flow (catch errors)
-                try:
-                    resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
-                    print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
-                except Exception as e:
-                    print("[INITIAL-TEST] BUY failed:", e)
-                try:
-                    resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
-                    print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
-                except Exception as e:
-                    print("[INITIAL-TEST] SELL failed:", e)
+        if init_price is not None:
+            # compute a tiny test qty (cap absolute test qty to a small value)
+            try:
+                test_qty = min((port.portfolio_value(init_price) * (alloc or 0.01) * risk_mult) / init_price, 0.001)
+                test_qty = float(max(0.0, test_qty))
+            except Exception:
+                test_qty = 0.0
+
+            if test_qty <= 0:
+                print("Initial dry-check: computed zero test qty, skipping test trade.")
             else:
-                # dry-run: don't call API, just show constructed payload for inspection
-                print("[INITIAL-TEST] Dry-run: not sending orders. To execute this test, re-run with --force.")
+                mode = "EXECUTING" if force else "SIMULATING (dry-run)"
+                print(f"[INITIAL-TEST] {mode} test trade: BUY {symbol} qty={test_qty:.8f} price={init_price:.2f}")
+                if force:
+                    # execute a quick buy then sell to verify order flow (catch errors)
+                    try:
+                        resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
+                        print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
+                    except Exception as e:
+                        print("[INITIAL-TEST] BUY failed:", e)
+                    try:
+                        resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
+                        print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
+                    except Exception as e:
+                        print("[INITIAL-TEST] SELL failed:", e)
+                else:
+                    print("[INITIAL-TEST] Dry-run: not sending orders. To execute this test, re-run with --force.")
+        else:
+            print("[INITIAL-TEST] failed to fetch ticker, skipping initial dry-test.")
     else:
-        print("[INITIAL-TEST] failed to fetch ticker, skipping initial dry-test.")
+        if verbose:
+            print("[INITIAL-TEST] skipped (use --check to enable)")
     # --- End initial dry-test ---
 
     interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
