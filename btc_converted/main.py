@@ -285,13 +285,13 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
             if force:
                 # execute a quick buy then sell to verify order flow (catch errors)
                 try:
-                    resp_buy = _place_order_safe(client, symbol, "BUY", test_qty, order_type='MARKET')
-                    print("[INITIAL-TEST] BUY response:", resp_buy)
+                    resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
+                    print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
                 except Exception as e:
                     print("[INITIAL-TEST] BUY failed:", e)
                 try:
-                    resp_sell = _place_order_safe(client, symbol, "SELL", test_qty, order_type='MARKET')
-                    print("[INITIAL-TEST] SELL response:", resp_sell)
+                    resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
+                    print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
                 except Exception as e:
                     print("[INITIAL-TEST] SELL failed:", e)
             else:
@@ -304,6 +304,9 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
     interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
     print(f"DEPLOY MODE: polling {pair} every {interval_secs}s. Dry-run={not force}")
 
+    last_signal = None
+    last_order_resp = None
+
     try:
         while True:
             price = fetch_roostoo_ticker(pair)
@@ -311,11 +314,14 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
             if price is None:
                 if verbose:
                     print(f"[{now}] failed to fetch price for {pair}")
+                # print status even on fetch failure
+                _print_status(port, pair, last_signal, last_order_resp, verbose)
                 time.sleep(max(5, interval_secs))
                 continue
 
             bar = {'time': now, 'open': price, 'high': price, 'low': price, 'close': price, 'volume': 0.0}
             sig = alpha.update(bar)
+            last_signal = sig
 
             if verbose:
                 print(f"[{now}] price={price:.2f} signal={sig} entry_price={alpha.entry_price}")
@@ -332,12 +338,15 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
                     print(f"[LIVE] BUY {symbol} qty={qty:.8f} price={price:.2f}")
                     if force:
                         try:
-                            resp = client.place_order(symbol, "BUY", qty, order_type='MARKET')
-                            print("Order resp:", resp)
+                            resp = _place_order_safe(client, pair, "BUY", qty, order_type='MARKET')
+                            last_order_resp = resp
+                            print("Order resp:", _summarize_order_resp(resp))
                         except Exception as e:
+                            last_order_resp = {"error": str(e)}
                             print("Order failed:", e)
                     else:
                         print("Dry-run: not sending order. Use --force to execute.")
+                        last_order_resp = None
                     # update local portfolio state optimistically
                     port.buy_allocation(price, alloc)
             elif sig == 'sell':
@@ -347,81 +356,240 @@ def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: f
                     print(f"[LIVE] SELL {symbol} qty={qty:.8f} price={price:.2f}")
                     if force:
                         try:
-                            resp = client.place_order(symbol, "SELL", qty, order_type='MARKET')
-                            print("Order resp:", resp)
+                            resp = _place_order_safe(client, pair, "SELL", qty, order_type='MARKET')
+                            last_order_resp = resp
+                            print("Order resp:", _summarize_order_resp(resp))
                         except Exception as e:
+                            last_order_resp = {"error": str(e)}
                             print("Order failed:", e)
                     else:
                         print("Dry-run: not sending order. Use --force to execute.")
+                        last_order_resp = None
                     # update local portfolio
                     port.sell_all(price)
+
+            # print compact status every loop iteration
+            _print_status(port, pair, last_signal, last_order_resp, verbose)
 
             # sleep until next poll
             time.sleep(interval_secs)
     except KeyboardInterrupt:
         print("Stopping live deploy loop (KeyboardInterrupt).")
 
-def _place_order_safe(client, symbol, side, quantity, order_type='MARKET'):
+def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET', price=None):
     """
-    Try to call RoostooClient.place_order with common keyword signature,
-    fall back to positional signature if client expects that.
+    Robust wrapper to call client.place_order with several common signatures.
+    - pair_or_coin: normalized pair like "BTC/USD" or base coin "BTC"
+    - tries keyword and positional forms, and both 'type' and 'order_type' names.
+    Returns the raw client response or raises last exception.
     """
-    try:
-        return client.place_order(symbol=symbol, side=side, quantity=quantity, order_type=order_type)
-    except TypeError:
-        # positional fallback
+    qty = str(quantity)
+    # possible keyword variants
+    kw_variants = [
+        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
+        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type},
+        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type},
+        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
+        {'symbol': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
+    ]
+    last_exc = None
+    for kw in kw_variants:
         try:
-            return client.place_order(symbol, side, quantity, order_type)
+            return client.place_order(**kw)
+        except TypeError as te:
+            last_exc = te
+            continue
         except Exception as e:
-            raise
+            # return error payload for visibility
+            return {"error": str(e)}
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Converted BTC backtest using Horus or live Roostoo deploy")
-    parser.add_argument('--symbol', type=str, default="BTCUSDT")
-    parser.add_argument('--interval', type=str, default='1d', choices=['1d','1h','15m'])
-    parser.add_argument('--source', type=str, default='horus', choices=['horus','binance'], help='Data source for backtest')
-    parser.add_argument('--limit', type=int, default=None, help="Number of bars to fetch (defaults to 1y depending on interval)")
-    parser.add_argument('--capital', type=float, default=100000.0)
-    parser.add_argument('--fee', type=float, default=0.0001)
-    parser.add_argument('--apikey', type=str, required=False)
-    parser.add_argument('--risk-mult', type=float, default=1.0)
-    parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--deploy', action='store_true', help='Run in live deploy mode using Roostoo')
-    parser.add_argument('--api-secret', type=str, default=None, help='Roostoo API secret (required for deploy)')
-    parser.add_argument('--allocation', type=float, default=0.5, help='Fraction of portfolio used when opening a trade (live)')
-    parser.add_argument('--force', action='store_true', help='Actually execute live orders (default dry-run)')
-    args = parser.parse_args()
+    # positional fallbacks
+    positional_variants = [
+        (pair_or_coin, side, qty),
+        (pair_or_coin, side, qty, order_type),
+        (pair_or_coin, side, qty, price),
+        (pair_or_coin, side, qty, price, order_type),
+    ]
+    for args in positional_variants:
+        try:
+            return client.place_order(*args)
+        except TypeError as te:
+            last_exc = te
+            continue
+        except Exception as e:
+            return {"error": str(e)}
 
-    if args.deploy:
-        # require keys for deploy
-        if not args.apikey or not args.api_secret:
-            print("Deploy mode requires --apikey and --api-secret")
-            sys.exit(1)
-        run_live(symbol=args.symbol,
-                 interval=args.interval,
-                 apikey=args.apikey,
-                 apisecret=args.api_secret,
-                 capital=args.capital,
-                 fee=args.fee,
-                 risk_mult=args.risk_mult,
-                 alloc=args.allocation,
-                 verbose=args.verbose,
-                 force=args.force)
-    else:
-        if args.limit is None:
-            if args.interval == '1d':
-                args.limit = 365
-            elif args.interval == '1h':
-                args.limit = 24 * 365
+    # if all attempts failed, raise last TypeError for visibility
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unable to call client.place_order with tested signatures")
+
+# --- new helpers: summarize order responses and print runtime status ---
+def _summarize_order_resp(resp):
+    """Return short string summary for rostoo order/place/query responses."""
+    try:
+        if resp is None:
+            return "no-response"
+        if isinstance(resp, dict):
+            if resp.get("Success") and resp.get("OrderDetail"):
+                od = resp.get("OrderDetail")
+                return f"{od.get('Side')} id={od.get('OrderID')} {od.get('Status')} price={od.get('Price')} qty={od.get('Quantity')}"
+            # some responses return OrderMatched list
+            if resp.get("Success") and resp.get("OrderMatched"):
+                matched = resp.get("OrderMatched")
+                if len(matched):
+                    o = matched[0]
+                    return f"{o.get('Side')} id={o.get('OrderID')} {o.get('Status')} price={o.get('Price')} qty={o.get('Quantity')}"
+            # generic dict -> show Success/ErrMsg
+            if "Success" in resp:
+                return f"Success={resp.get('Success')} Err={resp.get('ErrMsg','')}"
+            # fallback: stringify limited
+            return str({k: resp[k] for k in list(resp)[:6]})
+        # other types
+        return str(resp)
+    except Exception:
+        return repr(resp)
+
+def _print_status(port: 'SimplePortfolio', pair: str, last_signal, last_order_resp, verbose: bool=False):
+    """Print compact bot status line to terminal."""
+    try:
+        ts = pd.to_datetime('now')
+    except Exception:
+        import datetime
+        ts = datetime.datetime.utcnow()
+    cash = getattr(port, 'cash', None)
+    pos = getattr(port, 'positions', None)
+    avgp = getattr(port, 'avg_price', None)
+    trades = getattr(port, 'trade_count', None)
+    last_order_summary = _summarize_order_resp(last_order_resp)
+    line = (f"[STATUS {ts}] pair={pair} cash={cash:.2f if isinstance(cash,(int,float)) else cash} "
+            f"pos={pos:.6f if isinstance(pos,(int,float)) else pos} avgp={avgp if avgp is not None else 'N/A'} "
+            f"trades={trades} last_signal={last_signal} last_order={last_order_summary}")
+    print(line)
+    if verbose and last_order_resp:
+        # print full last order resp (truncated)
+        try:
+            print("[STATUS] last_order_resp:", json.dumps(last_order_resp, default=str)[:4000])
+        except Exception:
+            print("[STATUS] last_order_resp repr:", repr(last_order_resp))
+
+def run_live(symbol: str, interval: str, apikey: str, apisecret: str, capital: float, fee: float, risk_mult: float, alloc: float, verbose: bool, force: bool):
+    pair = _pair_from_symbol(symbol)
+    client = RoostooClient(api_key=apikey, secret_key=apisecret)
+    alpha = HybridAlphaConverted(volume_period=5, atr_period=10, momentum_period=3,
+                                 volume_multiplier=1.0, atr_multiplier=1.0, stop_loss_pct=0.05)
+    # live portfolio tracking (local)
+    port = SimplePortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
+
+    # --- Initial dry-test trade (run once, immediate) ---
+    try:
+        init_price = fetch_roostoo_ticker(pair)
+    except Exception:
+        init_price = None
+
+    if init_price is not None:
+        # compute a tiny test qty (cap absolute test qty to a small value)
+        try:
+            test_qty = min((port.portfolio_value(init_price) * (alloc or 0.01) * risk_mult) / init_price, 0.001)
+            test_qty = float(max(0.0, test_qty))
+        except Exception:
+            test_qty = 0.0
+
+        if test_qty <= 0:
+            print("Initial dry-check: computed zero test qty, skipping test trade.")
+        else:
+            mode = "EXECUTING" if force else "SIMULATING (dry-run)"
+            print(f"[INITIAL-TEST] {mode} test trade: BUY {symbol} qty={test_qty:.8f} price={init_price:.2f}")
+            if force:
+                # execute a quick buy then sell to verify order flow (catch errors)
+                try:
+                    resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
+                    print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
+                except Exception as e:
+                    print("[INITIAL-TEST] BUY failed:", e)
+                try:
+                    resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
+                    print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
+                except Exception as e:
+                    print("[INITIAL-TEST] SELL failed:", e)
             else:
-                args.limit = 4 * 365
+                # dry-run: don't call API, just show constructed payload for inspection
+                print("[INITIAL-TEST] Dry-run: not sending orders. To execute this test, re-run with --force.")
+    else:
+        print("[INITIAL-TEST] failed to fetch ticker, skipping initial dry-test.")
+    # --- End initial dry-test ---
 
-        run_backtest(symbol=args.symbol,
-                     interval=args.interval,
-                     limit=args.limit,
-                     apikey=args.apikey,
-                     source=args.source,
-                     capital=args.capital,
-                     fee=args.fee,
-                     risk_mult=args.risk_mult,
-                     verbose=args.verbose)
+    interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
+    print(f"DEPLOY MODE: polling {pair} every {interval_secs}s. Dry-run={not force}")
+
+    last_signal = None
+    last_order_resp = None
+
+    try:
+        while True:
+            price = fetch_roostoo_ticker(pair)
+            now = pd.to_datetime('now')
+            if price is None:
+                if verbose:
+                    print(f"[{now}] failed to fetch price for {pair}")
+                # print status even on fetch failure
+                _print_status(port, pair, last_signal, last_order_resp, verbose)
+                time.sleep(max(5, interval_secs))
+                continue
+
+            bar = {'time': now, 'open': price, 'high': price, 'low': price, 'close': price, 'volume': 0.0}
+            sig = alpha.update(bar)
+            last_signal = sig
+
+            if verbose:
+                print(f"[{now}] price={price:.2f} signal={sig} entry_price={alpha.entry_price}")
+
+            if sig == 'buy':
+                # compute quantity: use allocation fraction of portfolio
+                qty = None
+                if alloc is not None:
+                    qty = (port.portfolio_value(price) * alloc * risk_mult) / price
+                qty = float(max(0.0, qty or 0.0))
+                if qty <= 0:
+                    print("Computed zero qty, skipping order.")
+                else:
+                    print(f"[LIVE] BUY {symbol} qty={qty:.8f} price={price:.2f}")
+                    if force:
+                        try:
+                            resp = _place_order_safe(client, pair, "BUY", qty, order_type='MARKET')
+                            last_order_resp = resp
+                            print("Order resp:", _summarize_order_resp(resp))
+                        except Exception as e:
+                            last_order_resp = {"error": str(e)}
+                            print("Order failed:", e)
+                    else:
+                        print("Dry-run: not sending order. Use --force to execute.")
+                        last_order_resp = None
+                    # update local portfolio state optimistically
+                    port.buy_allocation(price, alloc)
+            elif sig == 'sell':
+                # close position
+                qty = port.positions
+                if qty > 0:
+                    print(f"[LIVE] SELL {symbol} qty={qty:.8f} price={price:.2f}")
+                    if force:
+                        try:
+                            resp = _place_order_safe(client, pair, "SELL", qty, order_type='MARKET')
+                            last_order_resp = resp
+                            print("Order resp:", _summarize_order_resp(resp))
+                        except Exception as e:
+                            last_order_resp = {"error": str(e)}
+                            print("Order failed:", e)
+                    else:
+                        print("Dry-run: not sending order. Use --force to execute.")
+                        last_order_resp = None
+                    # update local portfolio
+                    port.sell_all(price)
+
+            # print compact status every loop iteration
+            _print_status(port, pair, last_signal, last_order_resp, verbose)
+
+            # sleep until next poll
+            time.sleep(interval_secs)
+    except KeyboardInterrupt:
+        print("Stopping live deploy loop (KeyboardInterrupt).")
