@@ -114,11 +114,25 @@ class RoostooClient:
         except requests.RequestException:
             return None
 
-    def place_order(self, pair_or_coin: str, side: str, quantity: float, price: Optional[float] = None, order_type: Optional[str] = None) -> Optional[Dict]:
+    def place_order(self, pair_or_coin: Optional[str] = None, side: Optional[str] = None,
+                    quantity: Optional[float] = None, price: Optional[float] = None,
+                    order_type: Optional[str] = None, symbol: Optional[str] = None, **kwargs) -> Optional[Dict]:
         """
         Place a LIMIT or MARKET order.
         Accepts pair like "BTC/USD" or base coin "BTC" (will be converted to BTC/USD).
+        Compatible with callers using keyword 'symbol' or 'pair'.
         """
+        # support symbol= or pair= aliases
+        pair_or_coin = pair_or_coin or symbol or kwargs.get('pair') or kwargs.get('symbol')
+        if pair_or_coin is None:
+            raise TypeError("pair or symbol must be provided")
+
+        # normalize quantity possibly passed as string
+        try:
+            qty_val = float(quantity) if quantity is not None else None
+        except Exception:
+            qty_val = None
+
         pair = pair_or_coin if '/' in pair_or_coin else self._symbol_to_pair(pair_or_coin)
         if order_type is None:
             order_type = "LIMIT" if price is not None else "MARKET"
@@ -126,11 +140,14 @@ class RoostooClient:
         if order_type.upper() == 'LIMIT' and price is None:
             raise ValueError("LIMIT orders require a price")
 
+        if qty_val is None:
+            raise TypeError("quantity must be provided and numeric")
+
         payload = {
             'pair': pair,
-            'side': side.upper(),
+            'side': side.upper() if side is not None else "BUY",
             'type': order_type.upper(),
-            'quantity': str(quantity)
+            'quantity': str(qty_val)
         }
         if order_type.upper() == 'LIMIT' and price is not None:
             payload['price'] = str(price)
