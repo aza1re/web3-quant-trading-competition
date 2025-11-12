@@ -410,7 +410,9 @@ def run_live(symbol: str,
     if do_check:
         test_price = fetch_roostoo_ticker(pair)
         if test_price:
-            test_qty = min((port.portfolio_value(test_price) * alloc * risk_mult) / test_price, 0.001)
+            # choose smallest qty that clears min notional and step
+            base_qty = (_min_notional_usd(symbol) * 1.2) / test_price
+            test_qty = _ceil_to_step(symbol, base_qty)
             mode = "EXECUTING" if force else "DRY-RUN"
             print(f"[CHECK] {mode} test BUY qty={test_qty:.6f} price={test_price:.2f}")
             if force and test_qty > 0:
@@ -624,7 +626,8 @@ def run_live_multi(symbols: List[str],
         for s in symbols:
             p = tickers.get(pairs[s])
             if p:
-                test_qty = min((capital * alloc * risk_mult) / p, 0.001)
+                base_qty = (_min_notional_usd(s) * 1.2) / p
+                test_qty = _ceil_to_step(s, base_qty)
                 mode = "EXECUTING" if force else "DRY-RUN"
                 print(f"[CHECK] {mode} {s} test BUY qty={test_qty:.6f} price={p:.2f}")
                 if force and test_qty > 0:
