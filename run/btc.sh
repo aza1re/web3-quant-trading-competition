@@ -44,6 +44,7 @@ if [ "$DEPLOY" = "1" ]; then
 
     # --- run initial dry-test synchronously and print result BEFORE backgrounding ---
     echo "Running initial synchronous dry-test (prints directly)..."
+    export REPO_ROOT="$REPO_ROOT"
     "$PY" - <<'PY'
 import os, sys, math
 # ensure Python can import btc_converted and rostoo
@@ -99,12 +100,12 @@ else:
             if force and _place_order_safe is not None:
                 client = RoostooClient(api_key=os.environ.get('ROOSTOO_API_KEY'), secret_key=os.environ.get('ROOSTOO_API_SECRET'))
                 try:
-                    resp_buy = _place_order_safe(client, symbol, "BUY", test_qty)
+                    resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
                     print("[INITIAL-TEST] BUY response:", resp_buy)
                 except Exception as e:
                     print("[INITIAL-TEST] BUY failed:", e)
                 try:
-                    resp_sell = _place_order_safe(client, symbol, "SELL", test_qty)
+                    resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
                     print("[INITIAL-TEST] SELL response:", resp_sell)
                 except Exception as e:
                     print("[INITIAL-TEST] SELL failed:", e)
