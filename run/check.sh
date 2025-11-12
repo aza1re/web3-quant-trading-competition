@@ -15,9 +15,8 @@ RISK_MULT="${RISK_MULT:-2.0}"
 ALLOCATION="${ALLOCATION:-0.5}"  # fraction per trade
 DEPLOY="${DEPLOY:-0}"            # set to 1 to run live deploy (Roostoo)
 FORCE="${FORCE:-0}"              # set to 1 to actually submit live orders
-# NOTE: defaults here are placeholders — replace with your keys or export before running
-ROOSTOO_API_KEY="${ROOSTOO_API_KEY:-"S5dF9gHjK3lL1ZxCV7bN2mQwE0rT4yUiP6oA8sDdF2gJ0hKlZ9xC5vBnM4qW3eRt"}"
-ROOSTOO_API_SECRET="${ROOSTOO_API_SECRET:-"Y3uI7oPaS9dF1gHjK5lL6ZxCV0bN2mQwE4rT8yUiP6oA3sDdF7gJ0hKlZ1xC5vBn"}"
+ROOSTOO_API_KEY="${ROOSTOO_API_KEY:-}"
+ROOSTOO_API_SECRET="${ROOSTOO_API_SECRET:-}"
 HORUS_API_KEY="${HORUS_API_KEY:-}"
 FEE="${FEE:-0.0001}"
 
@@ -207,74 +206,6 @@ total = count_buy + count_sell
 print(f"[PRE-CHECK] Buys: {count_buy}   Sells: {count_sell}   Total signals: {total}")
 PY
     # --- end pre-check ---
-
-    # --- If Roostoo API keys supplied, try to query recent orders/fills for the checked symbol ---
-    if [ -n "${ROOSTOO_API_KEY:-}" ] && [ -n "${ROOSTOO_API_SECRET:-}" ]; then
-        echo "Roostoo keys provided — querying recent orders/fills for ${CHECK_SYMBOL}..."
-        "$PY" - <<PY
-import os,sys,json
-repo_root = "${REPO_ROOT}"
-sys.path.insert(0, os.path.join(repo_root, 'btc_converted'))
-sys.path.insert(0, repo_root)
-try:
-    from rostoo import RoostooClient
-except Exception as e:
-    print("ERROR: failed to import RoostooClient:", e)
-    sys.exit(1)
-
-key = "${ROOSTOO_API_KEY}"
-secret = "${ROOSTOO_API_SECRET}"
-symbol = "${CHECK_SYMBOL}"
-
-try:
-    client = RoostooClient(api_key=key, secret_key=secret)
-except Exception as e:
-    print("ERROR: failed to instantiate RoostooClient:", e)
-    sys.exit(1)
-
-# try to discover useful methods on the client that may return orders/trades/fills
-candidates = [n for n in dir(client) if any(k in n.lower() for k in ("order","trade","fill","history","fills","trades"))]
-def try_call(fn):
-    f = getattr(client, fn)
-    if not callable(f):
-        return None
-    # try common signatures
-    try_signatures = [
-        {"symbol": symbol},
-        {"pair": symbol},
-        {},
-    ]
-    for kwargs in try_signatures:
-        try:
-            return f(**kwargs)
-        except TypeError:
-            try:
-                return f(symbol)
-            except TypeError:
-                continue
-            except Exception:
-                continue
-        except Exception as e:
-            return f"error: {e}"
-    return None
-
-found = False
-for name in candidates:
-    out = try_call(name)
-    if out is not None:
-        found = True
-        print(f"[ROOSTOO] client.{name} returned (type={type(out)}):")
-        try:
-            print(json.dumps(out, default=str)[:4000])
-        except Exception:
-            print(repr(out)[:4000])
-        print("---")
-if not found:
-    print("[ROOSTOO] no obvious orders/trades/fills method returned data. Available candidate methods:", candidates)
-PY
-    else
-        echo "Roostoo keys not provided — skipping Roostoo order check."
-    fi
 
     echo "Running backtest command: ${CMD[*]}"
     exec "${CMD[@]}"
