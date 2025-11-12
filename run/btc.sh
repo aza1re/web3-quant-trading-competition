@@ -15,6 +15,7 @@ RISK_MULT="${RISK_MULT:-1.0}"
 ALLOCATION="${ALLOCATION:-0.5}"  # fraction per trade
 DEPLOY="${DEPLOY:-0}"            # set to 1 to run live deploy (Roostoo)
 FORCE="${FORCE:-0}"              # set to 1 to actually submit live orders
+CHECK="${CHECK:-0}"              # set to 1 to run initial dry-check trade
 ROOSTOO_API_KEY="${ROOSTOO_API_KEY:-}"
 ROOSTOO_API_SECRET="${ROOSTOO_API_SECRET:-}"
 HORUS_API_KEY="${HORUS_API_KEY:-}"
@@ -35,6 +36,13 @@ if [ "$DEPLOY" = "1" ]; then
         echo "DEPLOY: live orders will be submitted (FORCE=1)."
     else
         echo "DEPLOY: dry-run (no orders). Set FORCE=1 to submit live orders."
+    fi
+
+    if [ "$CHECK" = "1" ]; then
+        CMD+=( --check )
+        echo "Initial dry-check enabled (--check)."
+    else
+        echo "Initial dry-check disabled. Set CHECK=1 to enable."
     fi
 
     # Start bot in foreground so stdout/stderr show directly (no logfile)
