@@ -437,30 +437,45 @@ def run_live(symbol: str,
             if debug_signals:
                 print(f"[DBG] {symbol} t={closed_bar['time']} mom={alpha.last_momentum:.6f} atr={alpha.last_current_atr:.6f} sig={sig}")
 
+            # Log signal even if filtered
+            if sig in ('buy', 'sell'):
+                print(f"[SIG] {symbol} {sig} at {closed_bar['time']} px={closed_bar['close']:.6f}")
+
             if sig == 'buy':
                 day_key = now.date()
                 if day_key not in day_equity_open:
                     day_equity_open[day_key] = port.portfolio_value(price)
                 cur_eq = port.portfolio_value(price)
+                # risk filter
                 if (cur_eq - day_equity_open[day_key]) / day_equity_open[day_key] <= -max_daily_dd_pct:
-                    if verbose: print("[RISK] daily DD limit hit; skip BUY")
+                    print(f"[FILTER] {symbol} blocked by daily DD ({max_daily_dd_pct:.2%})")
                 else:
                     prev_pos = port.positions
                     port.buy_allocation(price, alloc)
-                    new_qty = port.positions - prev_pos   # incremental
-                    print(f"[LIVE] BUY {symbol} qty={new_qty:.6f} price={price:.2f} total_pos={port.positions:.6f}")
-                    if force and new_qty > 0:
-                        resp = _place_order_safe(client, pair, "BUY", new_qty)
+                    raw_qty = port.positions - prev_pos   # incremental
+                    rqty = _round_qty(symbol, raw_qty)
+                    notional = rqty * price
+                    if rqty <= 0:
+                        print(f"[FILTER] {symbol} no cash/qty after sizing")
+                    elif notional < _min_notional_usd(symbol):
+                        print(f"[FILTER] {symbol} notional too small ${notional:.2f} < ${_min_notional_usd(symbol):.2f}")
+                    else:
+                        print(f"[LIVE] BUY {symbol} qty={rqty:.6f} price={price:.2f} total_pos={port.positions:.6f}")
+                        if force:
+                            resp = _place_order_safe(client, pair, "BUY", rqty)
+                            last_order_resp = resp
+                            print("[ORDER]", _summarize_order_resp(resp))
+                            _print_raw_resp(resp, label=f"live-buy-{symbol}")
+            elif sig == 'sell' and port.positions > 0:
+                qty = _round_qty(symbol, port.positions)
+                if qty > 0:
+                    port.sell_all(price)
+                    print(f"[LIVE] SELL {symbol} qty={qty:.6f} price={price:.2f}")
+                    if force:
+                        resp = _place_order_safe(client, pair, "SELL", qty)
                         last_order_resp = resp
                         print("[ORDER]", _summarize_order_resp(resp))
-            elif sig == 'sell' and port.positions > 0:
-                qty = port.positions
-                port.sell_all(price)
-                print(f"[LIVE] SELL {symbol} qty={qty:.6f} price={price:.2f}")
-                if force:
-                    resp = _place_order_safe(client, pair, "SELL", qty)
-                    last_order_resp = resp
-                    print("[ORDER]", _summarize_order_resp(resp))
+                        _print_raw_resp(resp, label=f"live-sell-{symbol}")
 
             _print_status(port, pair, last_signal, last_order_resp, verbose)
             time.sleep(interval_secs)
@@ -637,32 +652,46 @@ def run_live_multi(symbols: List[str],
                 if debug_signals:
                     print(f"[DBG] {s} t={bar['time']} mom={alphas[s].last_momentum:.6f} atr={alphas[s].last_current_atr:.6f} sig={sig}")
 
+                if sig in ('buy', 'sell'):
+                    print(f"[SIG] {s} {sig} at {bar['time']} px={price:.6f}")
+
                 if sig == 'buy':
                     open_syms = [x for x, q in port.pos.items() if q > 0]
                     if len(open_syms) >= max_open_symbols:
-                        if verbose: print(f"[RISK] max_open_symbols reached, skip BUY {s}")
+                        print(f"[FILTER] {s} blocked by max_open_symbols={max_open_symbols}")
                         continue
                     day_key = now.date()
                     if day_key not in day_equity_open:
                         day_equity_open[day_key] = port.value(prices_now)
                     cur_eq = port.value(prices_now)
                     if (cur_eq - day_equity_open[day_key]) / day_equity_open[day_key] <= -max_daily_dd_pct:
-                        if verbose: print(f"[RISK] daily DD hit, skip BUY {s}")
+                        print(f"[FILTER] {s} blocked by daily DD ({max_daily_dd_pct:.2%})")
                         continue
-                    qty = port.buy_value(s, price, alloc, prices_now)
-                    if qty > 0:
-                        print(f"[LIVE] BUY {s} qty={qty:.6f} price={price:.2f}")
-                        if force:
-                            resp = _place_order_safe(client, pairs[s], "BUY", qty)
-                            print("[ORDER]", s, _summarize_order_resp(resp))
+                    raw_qty = port.buy_value(s, price, alloc, prices_now)
+                    rqty = _round_qty(s, raw_qty)
+                    notional = rqty * price
+                    if rqty <= 0:
+                        print(f"[FILTER] {s} no cash/qty after sizing")
+                        continue
+                    if notional < _min_notional_usd(s):
+                        print(f"[FILTER] {s} notional too small ${notional:.2f} < ${_min_notional_usd(s):.2f}")
+                        # revert portfolio cash if you want strict accounting; omit for simplicity
+                        continue
+                    print(f"[LIVE] BUY {s} qty={rqty:.6f} price={price:.2f}")
+                    if force:
+                        resp = _place_order_safe(client, pairs[s], "BUY", rqty)
+                        print("[ORDER]", s, _summarize_order_resp(resp))
+                        _print_raw_resp(resp, label=f"live-buy-{s}")
                 elif sig == 'sell':
-                    qty = port.pos.get(s, 0.0)
+                    qty = _round_qty(s, port.pos.get(s, 0.0))
                     if qty > 0:
                         sold = port.sell_all(s, price)
-                        print(f"[LIVE] SELL {s} qty={sold:.6f} price={price:.2f}")
-                        if force and sold > 0:
-                            resp = _place_order_safe(client, pairs[s], "SELL", sold)
+                        rq = _round_qty(s, sold)
+                        print(f"[LIVE] SELL {s} qty={rq:.6f} price={price:.2f}")
+                        if force and rq > 0:
+                            resp = _place_order_safe(client, pairs[s], "SELL", rq)
                             print("[ORDER]", s, _summarize_order_resp(resp))
+                            _print_raw_resp(resp, label=f"live-sell-{s}")
 
             if verbose:
                 eq = port.value({k: v for k, v in last_prices.items() if v})
