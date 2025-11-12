@@ -18,6 +18,7 @@ from binance import fetch_klines as fetch_binance_klines
 from horus import fetch_klines as fetch_horus_klines
 from alpha import HybridAlphaConverted
 from rostoo import RoostooClient, BASE_URL
+import traceback
 
 class SimplePortfolio:
     def __init__(self, cash=100000.0, fee=0.0001, risk_mult=1.0):
@@ -490,3 +491,41 @@ def _print_status(port: 'SimplePortfolio', pair: str, last_signal, last_order_re
             print("[STATUS] last_order_resp:", json.dumps(last_order_resp, default=str)[:4000])
         except Exception:
             print("[STATUS] last_order_resp repr:", repr(last_order_resp))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", required=True)
+    parser.add_argument("--interval", required=True)
+    parser.add_argument("--source", default="horus")
+    parser.add_argument("--limit", type=int, default=168)
+    parser.add_argument("--capital", type=float, default=100000.0)
+    parser.add_argument("--risk-mult", type=float, default=1.0)
+    parser.add_argument("--allocation", type=float, default=0.5)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--deploy", action="store_true")
+    parser.add_argument("--apikey", default=None)
+    parser.add_argument("--api-secret", default=None)
+    parser.add_argument("--check", action="store_true", help="Run initial dry-check trade before starting live loop")
+    parser.add_argument("--force", action="store_true", help="When deploying, actually submit orders (default: dry-run)")
+    args = parser.parse_args()
+
+    # Debug: show args immediately so we know main started
+    print("START main.py", {"argv": sys.argv, "env_DEPLOY": os.environ.get("DEPLOY")}, flush=True)
+
+    try:
+        if args.deploy:
+            print("Calling run_live (deploy) ...", flush=True)
+            run_live(args.symbol, args.interval, args.apikey, args.api_secret,
+                     args.capital, 0.0001, args.risk_mult, args.allocation,
+                     args.verbose, args.force, do_check=args.check)
+        else:
+            print("Calling run_backtest ...", flush=True)
+            run_backtest(args.symbol, args.interval, args.limit,
+                         apikey=args.apikey, source=args.source,
+                         capital=args.capital, fee=0.0001, risk_mult=args.risk_mult, verbose=args.verbose)
+    except Exception as e:
+        # always print full traceback to stdout so the caller (run/btc.sh) sees it
+        print("UNHANDLED EXCEPTION in main:", str(e), flush=True)
+        traceback.print_exc()
+        # exit non-zero so wrapper can detect failure
+        sys.exit(2)
