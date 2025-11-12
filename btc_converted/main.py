@@ -595,6 +595,21 @@ def run_live_multi(symbols: List[str],
         except Exception:
             pass
 
+    # synthetic ATR warmup if seeding failed
+    for s in symbols:
+        a = alphas[s]
+        if getattr(a, "last_current_atr", 0) == 0 and len(a.atr_window) == 0:
+            # inject small pseudo true ranges to avoid zero ATR (e.g. 0.05% of price)
+            try:
+                p = fetch_roostoo_ticker(pairs[s]) or 1.0
+                tr_val = p * 0.0005
+                for _ in range(10):
+                    a.atr_window.append(tr_val)
+                a.last_current_atr = tr_val  # set initial diagnostic
+                print(f"[WARMUP-FALLBACK] seeded synthetic ATR for {s} tr={tr_val:.6f}")
+            except Exception:
+                pass
+
     port = LiveMultiPortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
     day_equity_open = {}
     last_prices = {s: None for s in symbols}
