@@ -4,6 +4,14 @@ import pandas as pd
 
 HORUS_BASE = "https://api-horus.com"
 
+# Map non-standard ticker fragments to Horus asset codes
+ASSET_ALIASES = {
+    "S": "SONIC",          # result of SUSDT stripping -> S
+    "SUSDT": "SONIC",
+    "SONIC": "SONIC",
+    "SONICUSDT": "SONIC"
+}
+
 def fetch_klines(symbol: str = 'BTCUSDT', interval: str = '1h', limit: int = 500, api_key: str = None):
     """
     Fetch simple kline-like DataFrame from Horus price endpoint.
@@ -15,7 +23,11 @@ def fetch_klines(symbol: str = 'BTCUSDT', interval: str = '1h', limit: int = 500
     if interval not in ('1d', '1h', '15m'):
         raise ValueError("interval must be one of '1d','1h','15m'")
 
-    asset = symbol.upper().replace('USDT', '').replace('USD', '')
+    asset_raw = symbol.upper()
+    asset = asset_raw.replace('USDT', '').replace('USD', '')
+    # apply alias mapping
+    asset = ASSET_ALIASES.get(asset_raw, ASSET_ALIASES.get(asset, asset))
+
     interval_seconds = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
     end_ts = int(time.time())
     start_ts = end_ts - int(limit) * interval_seconds

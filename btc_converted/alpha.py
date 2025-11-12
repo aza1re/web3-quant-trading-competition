@@ -16,101 +16,112 @@ class HybridAlphaConverted:
                  momentum_period=3,
                  volume_multiplier=1.2,
                  atr_multiplier=1.1,
-                 spread_threshold=0.005,
-                 stop_loss_pct=0.03):
+                 stop_loss_pct=0.03,
+                 momentum_epsilon=0.0005,
+                 entry_epsilon=0.0008,
+                 exit_epsilon=0.0005,
+                 cooldown_bars=2,
+                 atr_mom_mult=0.2,        # raise default to filter noise
+                 min_hold_bars=2,         # NEW: minimum bars to hold before exit checks
+                 take_profit_pct=0.01):   # NEW: simple profit-taking (1% default)
         self.volume_period = volume_period
         self.atr_period = atr_period
         self.momentum_period = momentum_period
         self.volume_multiplier = volume_multiplier
         self.atr_multiplier = atr_multiplier
-        self.spread_threshold = spread_threshold
         self.stop_loss_pct = stop_loss_pct
+        self.momentum_epsilon = momentum_epsilon
+        self.entry_epsilon = entry_epsilon
+        self.exit_epsilon = exit_epsilon
+        self.cooldown_bars = cooldown_bars
+        self.atr_mom_mult = atr_mom_mult
+        self.min_hold_bars = min_hold_bars
+        self.take_profit_pct = take_profit_pct
 
-        self.window_size = max(self.volume_period, self.atr_period, self.momentum_period) + 5
-        self.window = deque(maxlen=self.window_size)  # store bars as dicts
-        self.volume_window = deque(maxlen=self.volume_period)
-        self.atr_window = deque(maxlen=self.atr_period)
+        self.window = deque(maxlen=max(volume_period, atr_period, momentum_period) + 5)
+        self.volume_window = deque(maxlen=volume_period)
+        self.atr_window = deque(maxlen=atr_period)
         self.entry_price = None
-        self.arbitrage_active = False  # kept for parity (not used without second venue)
+        self.entry_bar_index = None
 
-    def _compute_tr(self, cur, prev):
-        if prev is None:
-            return cur['high'] - cur['low']
-        return max(cur['high'] - cur['low'],
-                   abs(cur['high'] - prev['close']),
-                   abs(prev['close'] - cur['low']))
+        # diagnostics
+        self.last_avg_vol = 0
+        self.last_current_atr = 0
+        self.last_momentum = 0
+        self.last_volume_surge = False
+        self.last_positive_momentum = False
+        self.last_window_len = 0
+
+        self._bar_index = 0
+        self._last_trade_bar = -10
 
     def update(self, bar: dict):
-        """
-        Feed a bar (dict must contain 'open','high','low','close','volume','time').
-        Returns one of: 'buy', 'sell', None
-        """
-        prev = self.window[-1] if len(self.window) > 0 else None
+        self._bar_index += 1
         self.window.append(bar)
+        self.volume_window.append(bar.get('volume', 0) or 0)
 
-        # update volume window (use last N bar volumes average)
-        if len(self.window) >= 1:
-            # compute avg over last volume_period bars if available
-            if len(self.volume_window) == 0 and len(self.window) >= self.volume_period:
-                vols = [b['volume'] for b in list(self.window)[-self.volume_period:]]
-                self.volume_window.append(sum(vols) / len(vols))
-            elif len(self.window) >= 1:
-                # update running avg using last bar volume
-                if len(self.volume_window) < self.volume_period:
-                    self.volume_window.append(bar['volume'])
-                else:
-                    # maintain simple rolling average (append last volume then take mean)
-                    tmp = list(self.volume_window)
-                    tmp.append(bar['volume'])
-                    if len(tmp) > self.volume_period:
-                        tmp = tmp[-self.volume_period:]
-                    self.volume_window.clear()
-                    for v in tmp:
-                        self.volume_window.append(v)
-
-        # update ATR window
-        tr = self._compute_tr(bar, prev)
+        if len(self.window) >= 2:
+            prev = list(self.window)[-2]
+            tr = max(bar['high'] - bar['low'],
+                     abs(bar['high'] - prev['close']),
+                     abs(bar['low'] - prev['close']))
+        else:
+            tr = bar['high'] - bar['low']
         self.atr_window.append(tr)
+        current_atr = (sum(self.atr_window) / len(self.atr_window)) if self.atr_window else 0
 
-        # Only signal when we have enough history
-        if len(self.window) < max(self.volume_period, self.atr_period, self.momentum_period) + 1:
-            return None
+        avg_vol = sum(self.volume_window) / len(self.volume_window) if self.volume_window else 0
+        cur_vol = float(bar.get('volume', 0) or 0)
+        volume_surge = True if (avg_vol <= 0 or cur_vol <= 0) else (cur_vol > avg_vol * self.volume_multiplier)
 
-        # compute metrics
-        avg_vol = np.mean(list(self.volume_window)) if len(self.volume_window) else 0
-        # If avg_vol == 0 (Horus returns zero volumes), fall back to momentum-only signal
-        if avg_vol <= 0:
-            volume_surge = True  # ignore volume requirement when data absent
-        else:
-            volume_surge = (bar['volume'] > avg_vol * self.volume_multiplier)
-
-        current_atr = np.mean(list(self.atr_window)) if len(self.atr_window) else 0
-        # crude avg ATR as rolling mean of atr_window itself (short-term)
-        avg_atr = current_atr
-        high_volatility = current_atr > avg_atr * self.atr_multiplier if avg_atr > 0 else False
-
-        # momentum: compare to close N bars ago
         if len(self.window) > self.momentum_period:
-            past_price = list(self.window)[-1 - self.momentum_period]['close']
-            momentum = (bar['close'] - past_price) / past_price if past_price != 0 else 0
+            past_close = list(self.window)[-1 - self.momentum_period]['close']
+            momentum = (bar['close'] - past_close) / past_close if past_close else 0.0
         else:
-            momentum = 0
-        positive_momentum = momentum > 0
+            momentum = 0.0
 
-        # Simple directional rule (mirrors QC logic)
+        px = max(bar['close'], 1e-9)
+        atr_scaled = (current_atr / px) * self.atr_mom_mult if self.atr_mom_mult > 0 else 0.0
+        entry_thr = max(self.entry_epsilon, self.momentum_epsilon) + atr_scaled
+        exit_thr = max(self.exit_epsilon, self.momentum_epsilon) + atr_scaled
+
+        positive_momentum = momentum >= -self.momentum_epsilon
+
+        self.last_avg_vol = avg_vol
+        self.last_current_atr = current_atr
+        self.last_momentum = momentum
+        self.last_volume_surge = volume_surge
+        self.last_positive_momentum = positive_momentum
+        self.last_window_len = len(self.window)
+
+        can_trade = (self._bar_index - self._last_trade_bar) >= self.cooldown_bars
+
+        # ENTRY
         if self.entry_price is None:
-            if volume_surge and positive_momentum:
+            if can_trade and volume_surge and (momentum >= entry_thr):
                 self.entry_price = bar['close']
+                self.entry_bar_index = self._bar_index
+                self._last_trade_bar = self._bar_index
                 return 'buy'
-            # no explicit short path here (original QC mixed directional/arb)
         else:
-            # stop-loss
+            held_bars = self._bar_index - (self.entry_bar_index or self._bar_index)
+            # STOP-LOSS
             if bar['close'] <= self.entry_price * (1 - self.stop_loss_pct):
                 self.entry_price = None
+                self.entry_bar_index = None
+                self._last_trade_bar = self._bar_index
                 return 'sell'
-            # exit on momentum fade
-            if not positive_momentum:
+            # TAKE-PROFIT
+            if bar['close'] >= self.entry_price * (1 + self.take_profit_pct) and momentum <= 0:
                 self.entry_price = None
+                self.entry_bar_index = None
+                self._last_trade_bar = self._bar_index
+                return 'sell'
+            # Normal exit only after min_hold_bars
+            if held_bars >= self.min_hold_bars and can_trade and (momentum <= -exit_thr):
+                self.entry_price = None
+                self.entry_bar_index = None
+                self._last_trade_bar = self._bar_index
                 return 'sell'
 
         return None

@@ -1,9 +1,16 @@
-import os
-import sys
-# ensure repo root on path to import horus and Indicators if needed
+import os, sys
+
+# ensure repo root on path to import shared modules (binance, horus, etc.)
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+    sys.path.append(ROOT)
+
+from typing import List, Optional
+# use relative import for alpha inside the package
+from .alpha import HybridAlphaConverted
+
+from binance import fetch_klines as fetch_binance_klines
+from horus import fetch_klines as fetch_horus_klines
 
 import argparse
 import time
@@ -13,12 +20,71 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 from typing import List, Optional
-from binance import fetch_klines as fetch_binance_klines
-
-from horus import fetch_klines as fetch_horus_klines
-from alpha import HybridAlphaConverted
 from rostoo import RoostooClient, BASE_URL
 import traceback
+from datetime import datetime
+import math
+
+# --- NEW: BarAggregator for interval-based OHLC synthesis ---
+class BarAggregator:
+    """
+    Aggregates tick/last prices into OHLC bars for a given interval string: 15m | 1h | 1d
+    update(timestamp, price) -> returns a completed bar dict or None while accumulating.
+    """
+    def __init__(self, interval: str):
+        self.interval = interval
+        if interval not in ("15m", "1h", "1d"):
+            raise ValueError("BarAggregator interval must be one of 15m,1h,1d")
+        self.current_start = None
+        self.open = self.high = self.low = self.close = None
+        self.volume = 0.0  # placeholder (no real volume from ticker)
+        self._secs = 900 if interval == "15m" else 3600 if interval == "1h" else 86400
+
+    def _floor_ts(self, ts: pd.Timestamp):
+        epoch = int(ts.timestamp())
+        floored = (epoch // self._secs) * self._secs
+        return pd.to_datetime(floored, unit="s", utc=True)
+
+    def update(self, ts: pd.Timestamp, price: float, vol: float = 0.0):
+        """
+        Supply current timestamp (UTC) + last price.
+        Returns a finished bar when a new interval window begins, else None.
+        """
+        if price is None:
+            return None
+        ts_floor = self._floor_ts(ts)
+
+        # first bar initialize
+        if self.current_start is None:
+            self.current_start = ts_floor
+            self.open = self.high = self.low = self.close = float(price)
+            self.volume = float(vol or 0.0)
+            return None
+
+        # same interval window -> update running bar
+        if ts_floor == self.current_start:
+            p = float(price)
+            if p > self.high: self.high = p
+            if p < self.low: self.low = p
+            self.close = p
+            self.volume += float(vol or 0.0)
+            return None
+
+        # new interval -> finalize previous, start new
+        finished = {
+            "time": self.current_start,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume
+        }
+        # start new bar
+        self.current_start = ts_floor
+        p = float(price)
+        self.open = self.high = self.low = self.close = p
+        self.volume = float(vol or 0.0)
+        return finished
 
 class SimplePortfolio:
     def __init__(self, cash=100000.0, fee=0.0001, risk_mult=1.0):
@@ -101,6 +167,23 @@ def fetch_roostoo_ticker(pair: str) -> Optional[float]:
         return float(last)
     except Exception:
         return None
+
+def fetch_roostoo_tickers() -> dict:
+    """Fetch all tickers once; return map {pair: last_price}."""
+    ts = str(int(time.time() * 1000))
+    try:
+        resp = requests.get(f"{BASE_URL}/v3/ticker", params={'timestamp': ts}, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        data = j.get("Data", {}) or {}
+        out = {}
+        for k, v in data.items():
+            last = v.get("LastPrice") or v.get("Last")
+            if last is not None:
+                out[k] = float(last)
+        return out
+    except Exception:
+        return {}
 
 def run_backtest(symbol: str,
                  interval: str,
@@ -267,135 +350,328 @@ def run_live(symbol: str,
              alloc: float,
              verbose: bool,
              force: bool,
-             do_check: bool = False):
+             do_check: bool = False,
+             vol_mult: float = 1.0,
+             atr_mult: float = 1.0,
+             mom_period: int = 3,
+             stop_loss: float = 0.05,
+             momentum_epsilon: float = 0.0005,
+             entry_epsilon: float = 0.0008,
+             exit_epsilon: float = 0.0005,
+             cooldown_bars: int = 1,
+             atr_mom_mult: float = 0.0,
+             min_hold_bars: int = 2,
+             take_profit_pct: float = 0.01,
+             max_open_symbols: int = 1,
+             max_daily_dd_pct: float = 0.05,
+             debug_signals: bool = False,
+             poll_secs: Optional[int] = None):
     pair = _pair_from_symbol(symbol)
     client = RoostooClient(api_key=apikey, secret_key=apisecret)
-    alpha = HybridAlphaConverted(volume_period=5, atr_period=10, momentum_period=3,
-                                 volume_multiplier=1.0, atr_multiplier=1.0, stop_loss_pct=0.05)
-    # live portfolio tracking (local)
+    alpha = HybridAlphaConverted(volume_period=5,
+                                 atr_period=10,
+                                 momentum_period=mom_period,
+                                 volume_multiplier=vol_mult,
+                                 atr_multiplier=atr_mult,
+                                 stop_loss_pct=stop_loss,
+                                 momentum_epsilon=momentum_epsilon,
+                                 entry_epsilon=entry_epsilon,
+                                 exit_epsilon=exit_epsilon,
+                                 cooldown_bars=cooldown_bars,
+                                 atr_mom_mult=atr_mom_mult,
+                                 min_hold_bars=min_hold_bars,
+                                 take_profit_pct=take_profit_pct)
+
+    # warmup
+    try:
+        seed_df = fetch_binance_klines(symbol=symbol, interval=interval, limit=50)
+        if seed_df is not None and not seed_df.empty:
+            for _, r in seed_df.sort_values("open_time").iterrows():
+                alpha.update({'time': r['open_time'], 'open': float(r['open']), 'high': float(r['high']),
+                              'low': float(r['low']), 'close': float(r['close']),
+                              'volume': float(r['volume']) if 'volume' in r and not pd.isna(r['volume']) else 0.0})
+            if verbose: print(f"[WARMUP] seeded {len(seed_df)} bars")
+    except Exception:
+        pass
+
     port = SimplePortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
-
-    # --- Optional initial dry-test trade (run once, immediate) ---
-    if do_check:
-        try:
-            init_price = fetch_roostoo_ticker(pair)
-        except Exception:
-            init_price = None
-
-        if init_price is not None:
-            # compute a tiny test qty (cap absolute test qty to a small value)
-            try:
-                test_qty = min((port.portfolio_value(init_price) * (alloc or 0.01) * risk_mult) / init_price, 0.001)
-                test_qty = float(max(0.0, test_qty))
-            except Exception:
-                test_qty = 0.0
-
-            if test_qty <= 0:
-                print("Initial dry-check: computed zero test qty, skipping test trade.")
-            else:
-                mode = "EXECUTING" if force else "SIMULATING (dry-run)"
-                print(f"[INITIAL-TEST] {mode} test trade: BUY {symbol} qty={test_qty:.8f} price={init_price:.2f}")
-                if force:
-                    # execute a quick buy then sell to verify order flow (catch errors)
-                    try:
-                        resp_buy = _place_order_safe(client, pair, "BUY", test_qty, order_type='MARKET')
-                        print("[INITIAL-TEST] BUY response:", _summarize_order_resp(resp_buy))
-                        _print_raw_resp(resp_buy, "initial-buy")
-                    except Exception as e:
-                        print("[INITIAL-TEST] BUY failed:", e)
-                    try:
-                        resp_sell = _place_order_safe(client, pair, "SELL", test_qty, order_type='MARKET')
-                        print("[INITIAL-TEST] SELL response:", _summarize_order_resp(resp_sell))
-                        _print_raw_resp(resp_sell, "initial-sell")
-                    except Exception as e:
-                        print("[INITIAL-TEST] SELL failed:", e)
-                else:
-                    print("[INITIAL-TEST] Dry-run: not sending orders. To execute this test, re-run with --force.")
-        else:
-            print("[INITIAL-TEST] failed to fetch ticker, skipping initial dry-test.")
-    else:
-        if verbose:
-            print("[INITIAL-TEST] skipped (use --check to enable)")
-    # --- End initial dry-test ---
-
-    interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
-    print(f"DEPLOY MODE: polling {pair} every {interval_secs}s. Dry-run={not force}")
-
+    day_equity_open = {}
     last_signal = None
     last_order_resp = None
+    prices_now = {}
+
+    interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
+    if poll_secs and poll_secs > 0:
+        interval_secs = poll_secs
+    print(f"DEPLOY SINGLE: polling {pair} every {interval_secs}s. Dry-run={not force}")
+
+    agg = BarAggregator(interval)
+
+    if do_check:
+        test_price = fetch_roostoo_ticker(pair)
+        if test_price:
+            test_qty = min((port.portfolio_value(test_price) * alloc * risk_mult) / test_price, 0.001)
+            mode = "EXECUTING" if force else "DRY-RUN"
+            print(f"[CHECK] {mode} test BUY qty={test_qty:.6f} price={test_price:.2f}")
+            if force and test_qty > 0:
+                resp_b = _place_order_safe(client, pair, "BUY", test_qty)
+                print("[CHECK ORDER BUY]", _summarize_order_resp(resp_b))
+                _print_raw_resp(resp_b, label="check-buy")
+                resp_s = _place_order_safe(client, pair, "SELL", test_qty)
+                print("[CHECK ORDER SELL]", _summarize_order_resp(resp_s))
+                _print_raw_resp(resp_s, label="check-sell")
 
     try:
         while True:
             price = fetch_roostoo_ticker(pair)
-            now = pd.to_datetime('now')
+            now = pd.to_datetime('now', utc=True)
             if price is None:
-                if verbose:
-                    print(f"[{now}] failed to fetch price for {pair}")
-                # print status even on fetch failure
-                _print_status(port, pair, last_signal, last_order_resp, verbose)
-                time.sleep(max(5, interval_secs))
-                continue
-
-            bar = {'time': now, 'open': price, 'high': price, 'low': price, 'close': price, 'volume': 0.0}
-            sig = alpha.update(bar)
+                if verbose: print("[WARN] no price")
+                time.sleep(interval_secs); continue
+            prices_now[symbol] = price
+            closed_bar = agg.update(now, price)
+            if closed_bar is None:
+                time.sleep(interval_secs); continue
+            sig = alpha.update(closed_bar)
             last_signal = sig
-
-            if verbose:
-                # alpha.entry_price may not exist until set; guard with getattr
-                entry_price = getattr(alpha, "entry_price", None)
-                print(f"[{now}] price={price:.2f} signal={sig} entry_price={entry_price}")
+            if debug_signals:
+                print(f"[DBG] {symbol} t={closed_bar['time']} mom={alpha.last_momentum:.6f} atr={alpha.last_current_atr:.6f} sig={sig}")
 
             if sig == 'buy':
-                # compute quantity: use allocation fraction of portfolio
-                qty = None
-                if alloc is not None:
-                    qty = (port.portfolio_value(price) * alloc * risk_mult) / price
-                qty = float(max(0.0, qty or 0.0))
-                if qty <= 0:
-                    print("Computed zero qty, skipping order.")
+                day_key = now.date()
+                if day_key not in day_equity_open:
+                    day_equity_open[day_key] = port.portfolio_value(price)
+                cur_eq = port.portfolio_value(price)
+                if (cur_eq - day_equity_open[day_key]) / day_equity_open[day_key] <= -max_daily_dd_pct:
+                    if verbose: print("[RISK] daily DD limit hit; skip BUY")
                 else:
-                    print(f"[LIVE] BUY {symbol} qty={qty:.8f} price={price:.2f}")
-                    if force:
-                        try:
-                            resp = _place_order_safe(client, pair, "BUY", qty, order_type='MARKET')
-                            last_order_resp = resp
-                            print("Order resp:", _summarize_order_resp(resp))
-                            _print_raw_resp(resp, "live-buy")
-                        except Exception as e:
-                            last_order_resp = {"error": str(e)}
-                            print("Order failed:", e)
-                    else:
-                        print("Dry-run: not sending order. Use --force to execute.")
-                        last_order_resp = None
-                    # update local portfolio state optimistically
+                    prev_pos = port.positions
                     port.buy_allocation(price, alloc)
-            elif sig == 'sell':
-                # close position
+                    new_qty = port.positions - prev_pos   # incremental
+                    print(f"[LIVE] BUY {symbol} qty={new_qty:.6f} price={price:.2f} total_pos={port.positions:.6f}")
+                    if force and new_qty > 0:
+                        resp = _place_order_safe(client, pair, "BUY", new_qty)
+                        last_order_resp = resp
+                        print("[ORDER]", _summarize_order_resp(resp))
+            elif sig == 'sell' and port.positions > 0:
                 qty = port.positions
-                if qty > 0:
-                    print(f"[LIVE] SELL {symbol} qty={qty:.8f} price={price:.2f}")
-                    if force:
-                        try:
-                            resp = _place_order_safe(client, pair, "SELL", qty, order_type='MARKET')
-                            last_order_resp = resp
-                            print("Order resp:", _summarize_order_resp(resp))
-                            _print_raw_resp(resp, "live-sell")
-                        except Exception as e:
-                            last_order_resp = {"error": str(e)}
-                            print("Order failed:", e)
-                    else:
-                        print("Dry-run: not sending order. Use --force to execute.")
-                        last_order_resp = None
-                    # update local portfolio
-                    port.sell_all(price)
+                port.sell_all(price)
+                print(f"[LIVE] SELL {symbol} qty={qty:.6f} price={price:.2f}")
+                if force:
+                    resp = _place_order_safe(client, pair, "SELL", qty)
+                    last_order_resp = resp
+                    print("[ORDER]", _summarize_order_resp(resp))
 
-            # print compact status every loop iteration
             _print_status(port, pair, last_signal, last_order_resp, verbose)
-
-            # sleep until next poll
             time.sleep(interval_secs)
     except KeyboardInterrupt:
-        print("Stopping live deploy loop (KeyboardInterrupt).")
+        print("Stopping single-symbol live.")
+
+# --- Multi-asset live portfolio ---
+class LiveMultiPortfolio:
+    def __init__(self, cash=100000.0, fee=0.0001, risk_mult=1.0):
+        self.cash = float(cash)
+        self.fee = float(fee)
+        self.risk_mult = float(risk_mult)
+        self.pos = {}      # sym -> qty
+        self.avgp = {}     # sym -> avg price
+        self.trade_count = 0
+        self.trade_sizes = []
+        self.trade_values = []
+
+    def value(self, prices: dict) -> float:
+        v = self.cash
+        for s, q in self.pos.items():
+            p = prices.get(s)
+            if p is not None:
+                v += q * p
+        return v
+
+    def buy_value(self, sym: str, price: float, allocation: float, prices_now: dict) -> float:
+        pv = self.value(prices_now)
+        target = pv * allocation * self.risk_mult
+        max_afford = self.cash / (1 + self.fee)
+        trade_val = min(target, max_afford)
+        if trade_val <= 0 or price <= 0:
+            return 0.0
+        qty = trade_val / price
+        cost = qty * price
+        fee = cost * self.fee
+        self.cash -= (cost + fee)
+        prev_qty = self.pos.get(sym, 0.0)
+        prev_avg = self.avgp.get(sym)
+        new_qty = prev_qty + qty
+        self.avgp[sym] = price if prev_qty == 0 or prev_avg is None else (prev_avg * prev_qty + cost) / new_qty
+        self.pos[sym] = new_qty
+        self.trade_count += 1
+        self.trade_sizes.append(qty)
+        self.trade_values.append(cost)
+        return qty
+
+    def sell_all(self, sym: str, price: float):
+        qty = self.pos.get(sym, 0.0)
+        if qty <= 0 or price <= 0:
+            return 0.0
+        proceeds = qty * price
+        fee = proceeds * self.fee
+        self.cash += (proceeds - fee)
+        self.trade_count += 1
+        self.trade_sizes.append(qty)
+        self.trade_values.append(proceeds)
+        self.pos[sym] = 0.0
+        self.avgp.pop(sym, None)
+        return qty
+
+def run_live_multi(symbols: List[str],
+                   interval: str,
+                   apikey: str,
+                   apisecret: str,
+                   capital: float,
+                   fee: float,
+                   risk_mult: float,
+                   alloc: float,
+                   verbose: bool,
+                   force: bool,
+                   do_check: bool = False,
+                   vol_mult: float = 1.0,
+                   atr_mult: float = 1.0,
+                   mom_period: int = 3,
+                   stop_loss: float = 0.05,
+                   momentum_epsilon: float = 0.0005,
+                   entry_epsilon: float = 0.0008,
+                   exit_epsilon: float = 0.0005,
+                   cooldown_bars: int = 1,
+                   atr_mom_mult: float = 0.0,
+                   min_hold_bars: int = 2,
+                   take_profit_pct: float = 0.01,
+                   max_open_symbols: int = 3,
+                   max_daily_dd_pct: float = 0.05,
+                   debug_signals: bool = False,
+                   poll_secs: Optional[int] = None):
+    client = RoostooClient(api_key=apikey, secret_key=apisecret)
+    alphas = {
+        s: HybridAlphaConverted(volume_period=5,
+                                atr_period=10,
+                                momentum_period=mom_period,
+                                volume_multiplier=vol_mult,
+                                atr_multiplier=atr_mult,
+                                stop_loss_pct=stop_loss,
+                                momentum_epsilon=momentum_epsilon,
+                                entry_epsilon=entry_epsilon,
+                                exit_epsilon=exit_epsilon,
+                                cooldown_bars=cooldown_bars,
+                                atr_mom_mult=atr_mom_mult,
+                                min_hold_bars=min_hold_bars,
+                                take_profit_pct=take_profit_pct)
+        for s in symbols
+    }
+    aggs = {s: BarAggregator(interval) for s in symbols}
+    pairs = {s: _pair_from_symbol(s) for s in symbols}
+
+    # warmup
+    for s in symbols:
+        try:
+            seed = fetch_binance_klines(symbol=s, interval=interval, limit=30)
+            if seed is not None and not seed.empty:
+                for _, r in seed.sort_values("open_time").iterrows():
+                    alphas[s].update({'time': r['open_time'], 'open': float(r['open']), 'high': float(r['high']),
+                                      'low': float(r['low']), 'close': float(r['close']),
+                                      'volume': float(r['volume']) if 'volume' in r and not pd.isna(r['volume']) else 0.0})
+        except Exception:
+            pass
+
+    port = LiveMultiPortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
+    day_equity_open = {}
+    last_prices = {s: None for s in symbols}
+
+    interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
+    if poll_secs and poll_secs > 0:
+        interval_secs = poll_secs
+    print(f"DEPLOY MULTI: polling {','.join(symbols)} every {interval_secs}s. Dry-run={not force}")
+
+    if do_check:
+        tickers = fetch_roostoo_tickers()
+        for s in symbols:
+            p = tickers.get(pairs[s])
+            if p:
+                test_qty = min((capital * alloc * risk_mult) / p, 0.001)
+                mode = "EXECUTING" if force else "DRY-RUN"
+                print(f"[CHECK] {mode} {s} test BUY qty={test_qty:.6f} price={p:.2f}")
+                if force and test_qty > 0:
+                    resp_b = _place_order_safe(client, pairs[s], "BUY", test_qty)
+                    print("[CHECK ORDER BUY]", s, _summarize_order_resp(resp_b))
+                    _print_raw_resp(resp_b, label=f"check-buy-{s}")
+                    resp_s = _place_order_safe(client, pairs[s], "SELL", test_qty)
+                    print("[CHECK ORDER SELL]", s, _summarize_order_resp(resp_s))
+                    _print_raw_resp(resp_s, label=f"check-sell-{s}")
+
+    try:
+        while True:
+            tickers = fetch_roostoo_tickers()
+            now = pd.to_datetime('now', utc=True)
+            prices_now = {}
+
+            # update aggregators
+            closed = []
+            for s in symbols:
+                pr = tickers.get(pairs[s])
+                if pr is None:
+                    continue
+                last_prices[s] = pr
+                prices_now[s] = pr
+                bar_closed = aggs[s].update(now, pr)
+                if bar_closed is not None:
+                    closed.append((s, bar_closed))
+                elif debug_signals:
+                    # show interim diagnostics using last known values
+                    a = alphas[s]
+                    try:
+                        print(f"[DBG~] {s} t={now} price={pr:.6f} mom={a.last_momentum:.6f} atr={a.last_current_atr:.6f}")
+                    except Exception:
+                        pass
+
+            # process signals
+            for s, bar in closed:
+                sig = alphas[s].update(bar)
+                price = bar['close']
+                if debug_signals:
+                    print(f"[DBG] {s} t={bar['time']} mom={alphas[s].last_momentum:.6f} atr={alphas[s].last_current_atr:.6f} sig={sig}")
+
+                if sig == 'buy':
+                    open_syms = [x for x, q in port.pos.items() if q > 0]
+                    if len(open_syms) >= max_open_symbols:
+                        if verbose: print(f"[RISK] max_open_symbols reached, skip BUY {s}")
+                        continue
+                    day_key = now.date()
+                    if day_key not in day_equity_open:
+                        day_equity_open[day_key] = port.value(prices_now)
+                    cur_eq = port.value(prices_now)
+                    if (cur_eq - day_equity_open[day_key]) / day_equity_open[day_key] <= -max_daily_dd_pct:
+                        if verbose: print(f"[RISK] daily DD hit, skip BUY {s}")
+                        continue
+                    qty = port.buy_value(s, price, alloc, prices_now)
+                    if qty > 0:
+                        print(f"[LIVE] BUY {s} qty={qty:.6f} price={price:.2f}")
+                        if force:
+                            resp = _place_order_safe(client, pairs[s], "BUY", qty)
+                            print("[ORDER]", s, _summarize_order_resp(resp))
+                elif sig == 'sell':
+                    qty = port.pos.get(s, 0.0)
+                    if qty > 0:
+                        sold = port.sell_all(s, price)
+                        print(f"[LIVE] SELL {s} qty={sold:.6f} price={price:.2f}")
+                        if force and sold > 0:
+                            resp = _place_order_safe(client, pairs[s], "SELL", sold)
+                            print("[ORDER]", s, _summarize_order_resp(resp))
+
+            if verbose:
+                eq = port.value({k: v for k, v in last_prices.items() if v})
+                open_pos = [(k, port.pos[k]) for k in port.pos if port.pos[k] > 0]
+                print(f"[STATUS] t={now} equity={eq:.2f} cash={port.cash:.2f} open={open_pos} trades={port.trade_count}")
+
+            time.sleep(interval_secs)
+    except KeyboardInterrupt:
+        print("Stopping multi-symbol live.")
 
 def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET', price=None):
     """
@@ -405,13 +681,13 @@ def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET',
     Returns the raw client response or raises last exception.
     """
     qty = str(quantity)
-    # possible keyword variants
+    # possible keyword variants (include price so client receives it when supported)
     kw_variants = [
-        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
-        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type},
-        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type},
-        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
-        {'symbol': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type},
+        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type, 'price': price},
+        {'pair_or_coin': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type, 'price': price},
+        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'type': order_type, 'price': price},
+        {'pair': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type, 'price': price},
+        {'symbol': pair_or_coin, 'side': side, 'quantity': qty, 'order_type': order_type, 'price': price},
     ]
     last_exc = None
     for kw in kw_variants:
@@ -487,32 +763,18 @@ def _print_raw_resp(resp, label="raw"):
 
 def _print_status(port: 'SimplePortfolio', pair: str, last_signal, last_order_resp, verbose: bool=False):
     """Print compact bot status line to terminal."""
-    try:
-        ts = pd.to_datetime('now')
-    except Exception:
-        import datetime
-        ts = datetime.datetime.utcnow()
-    cash = getattr(port, 'cash', None)
-    pos = getattr(port, 'positions', None)
-    avgp = getattr(port, 'avg_price', None)
-    trades = getattr(port, 'trade_count', None)
-    last_order_summary = _summarize_order_resp(last_order_resp)
-    # guard formatting when values are None
-    cash_s = f"{cash:.2f}" if isinstance(cash, (int, float)) else str(cash)
-    pos_s = f"{pos:.6f}" if isinstance(pos, (int, float)) else str(pos)
-    avgp_s = f"{avgp:.2f}" if isinstance(avgp, (int, float)) else ("N/A" if avgp is None else str(avgp))
-    line = (f"[STATUS {ts}] pair={pair} cash={cash_s} pos={pos_s} avgp={avgp_s} "
-            f"trades={trades} last_signal={last_signal} last_order={last_order_summary}")
-    print(line)
-    if verbose and last_order_resp:
-        try:
-            print("[STATUS] last_order_resp:", json.dumps(last_order_resp, default=str)[:4000])
-        except Exception:
-            print("[STATUS] last_order_resp repr:", repr(last_order_resp))
+    # REMOVED status spam unless verbose explicitly True
+    if not verbose:
+        return
+    print(f"[STATUS {datetime.utcnow()}] pair={pair} cash={port.cash:.2f} "
+          f"pos={port.positions:.6f} avgp={port.avg_price if port.avg_price else 'N/A'} "
+          f"trades={port.trade_count} last_signal={last_signal} "
+          f"last_order={'no-response' if last_order_resp is None else 'ok'}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", required=True)
+    parser.add_argument("--symbol", required=False)
+    parser.add_argument("--symbols", required=False, help="comma-separated symbols, e.g. BTCUSDT,ETHUSDT,TRXUSDT,LTCUSDT,SUSDT")
     parser.add_argument("--interval", required=True)
     parser.add_argument("--source", default="horus")
     parser.add_argument("--limit", type=int, default=168)
@@ -523,27 +785,70 @@ if __name__ == "__main__":
     parser.add_argument("--deploy", action="store_true")
     parser.add_argument("--apikey", default=None)
     parser.add_argument("--api-secret", default=None)
-    parser.add_argument("--check", action="store_true", help="Run initial dry-check trade before starting live loop")
-    parser.add_argument("--force", action="store_true", help="When deploying, actually submit orders (default: dry-run)")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--vol-mult", type=float, default=1.0)
+    parser.add_argument("--atr-mult", type=float, default=1.0)
+    parser.add_argument("--mom-period", type=int, default=3)
+    parser.add_argument("--stop-loss", type=float, default=0.05)
+    parser.add_argument("--debug-signals", action="store_true")
+    parser.add_argument("--poll-secs", type=int, default=None)
+    parser.add_argument("--momentum-epsilon", type=float, default=0.0005)
+    parser.add_argument("--entry-epsilon", type=float, default=0.0008)
+    parser.add_argument("--exit-epsilon", type=float, default=0.0005)
+    parser.add_argument("--cooldown-bars", type=int, default=1)
+    parser.add_argument("--atr-mom-mult", type=float, default=0.0)
+    parser.add_argument("--min-hold-bars", type=int, default=2)
+    parser.add_argument("--take-profit-pct", type=float, default=0.01)
+    parser.add_argument("--max-open-symbols", type=int, default=3)
+    parser.add_argument("--max-daily-dd-pct", type=float, default=0.05)
     args = parser.parse_args()
 
-    # Debug: show args immediately so we know main started
     print("START main.py", {"argv": sys.argv, "env_DEPLOY": os.environ.get("DEPLOY")}, flush=True)
 
     try:
         if args.deploy:
-            print("Calling run_live (deploy) ...", flush=True)
-            run_live(args.symbol, args.interval, args.apikey, args.api_secret,
-                     args.capital, 0.0001, args.risk_mult, args.allocation,
-                     args.verbose, args.force, do_check=args.check)
+            if args.symbols:
+                syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+                run_live_multi(syms, args.interval, args.apikey, args.api_secret,
+                               args.capital, 0.0001, args.risk_mult, args.allocation,
+                               args.verbose, args.force, do_check=args.check,
+                               vol_mult=args.vol_mult, atr_mult=args.atr_mult,  # FIX: use atr_mult not atr_mom_mult
+                               mom_period=args.mom_period, stop_loss=args.stop_loss,
+                               momentum_epsilon=args.momentum_epsilon,
+                               entry_epsilon=args.entry_epsilon,
+                               exit_epsilon=args.exit_epsilon,
+                               cooldown_bars=args.cooldown_bars,
+                               atr_mom_mult=args.atr_mom_mult,
+                               min_hold_bars=args.min_hold_bars,
+                               take_profit_pct=args.take_profit_pct,
+                               max_open_symbols=args.max_open_symbols,
+                               max_daily_dd_pct=args.max_daily_dd_pct,
+                               debug_signals=args.debug_signals,
+                               poll_secs=args.poll_secs)
+            else:
+                run_live(args.symbol or "BTCUSDT", args.interval, args.apikey, args.api_secret,
+                         args.capital, 0.0001, args.risk_mult, args.allocation,
+                         args.verbose, args.force, do_check=args.check,
+                         vol_mult=args.vol_mult, atr_mult=args.atr_mult,  # FIX here too
+                         mom_period=args.mom_period, stop_loss=args.stop_loss,
+                         momentum_epsilon=args.momentum_epsilon,
+                         entry_epsilon=args.entry_epsilon,
+                         exit_epsilon=args.exit_epsilon,
+                         cooldown_bars=args.cooldown_bars,
+                         atr_mom_mult=args.atr_mom_mult,
+                         min_hold_bars=args.min_hold_bars,
+                         take_profit_pct=args.take_profit_pct,
+                         max_open_symbols=args.max_open_symbols,
+                         max_daily_dd_pct=args.max_daily_dd_pct,
+                         debug_signals=args.debug_signals,
+                         poll_secs=args.poll_secs)
         else:
             print("Calling run_backtest ...", flush=True)
-            run_backtest(args.symbol, args.interval, args.limit,
+            run_backtest((args.symbol or "BTCUSDT"), args.interval, args.limit,
                          apikey=args.apikey, source=args.source,
                          capital=args.capital, fee=0.0001, risk_mult=args.risk_mult, verbose=args.verbose)
     except Exception as e:
-        # always print full traceback to stdout so the caller (run/btc.sh) sees it
         print("UNHANDLED EXCEPTION in main:", str(e), flush=True)
         traceback.print_exc()
-        # exit non-zero so wrapper can detect failure
         sys.exit(2)
