@@ -21,9 +21,14 @@ class HybridAlphaConverted:
                  entry_epsilon=0.0008,
                  exit_epsilon=0.0005,
                  cooldown_bars=2,
-                 atr_mom_mult=0.2,        # raise default to filter noise
-                 min_hold_bars=2,         # NEW: minimum bars to hold before exit checks
-                 take_profit_pct=0.01):   # NEW: simple profit-taking (1% default)
+                 atr_mom_mult=0.2,
+                 min_hold_bars=2,
+                 take_profit_pct=0.01,
+                 trailing_stop_pct=0.02,
+                 min_cash_usd=10.0,
+                 min_cash_pct_to_buy=0.02,
+                 tp_immediate: bool = False   # NEW: take profit immediately when threshold hit
+                 ):
         self.volume_period = volume_period
         self.atr_period = atr_period
         self.momentum_period = momentum_period
@@ -37,12 +42,23 @@ class HybridAlphaConverted:
         self.atr_mom_mult = atr_mom_mult
         self.min_hold_bars = min_hold_bars
         self.take_profit_pct = take_profit_pct
+        self.trailing_stop_pct = trailing_stop_pct
+        self.min_cash_usd = float(min_cash_usd)
+        self.min_cash_pct_to_buy = float(min_cash_pct_to_buy)
+        self.tp_immediate = bool(tp_immediate)  # NEW
 
         self.window = deque(maxlen=max(volume_period, atr_period, momentum_period) + 5)
         self.volume_window = deque(maxlen=volume_period)
         self.atr_window = deque(maxlen=atr_period)
         self.entry_price = None
         self.entry_bar_index = None
+        self.entry_peak_price = None  # NEW: peak close since entry
+
+        # account context (optional; set by main during live)
+        self.usd_free = None
+        self.usd_total = None
+        self.pos_qty = 0.0
+        self.pos_avg_price = None
 
         # diagnostics
         self.last_avg_vol = 0
@@ -54,6 +70,17 @@ class HybridAlphaConverted:
 
         self._bar_index = 0
         self._last_trade_bar = -10
+
+    def set_account_context(self, usd_free: float | None = None, usd_total: float | None = None,
+                            pos_qty: float | None = None, pos_avg_price: float | None = None):
+        """Optional live context: lets alpha apply cash gates and PnL-aware exits."""
+        try:
+            if usd_free is not None: self.usd_free = float(usd_free)
+            if usd_total is not None: self.usd_total = float(usd_total)
+            if pos_qty is not None: self.pos_qty = float(pos_qty)
+            if pos_avg_price is not None: self.pos_avg_price = float(pos_avg_price)
+        except Exception:
+            pass
 
     def update(self, bar: dict):
         self._bar_index += 1
@@ -96,31 +123,65 @@ class HybridAlphaConverted:
 
         can_trade = (self._bar_index - self._last_trade_bar) >= self.cooldown_bars
 
-        # ENTRY
+        # Track peak after entry
+        if self.entry_price is not None:
+            self.entry_peak_price = max(self.entry_peak_price or self.entry_price, bar['close'])
+
+        # ENTRY (with cash gating if account context is available)
         if self.entry_price is None:
-            if can_trade and volume_surge and (momentum >= entry_thr):
+            # cash gates
+            if self.usd_free is not None and self.usd_total is not None:
+                cash_ok = (self.usd_free >= self.min_cash_usd) and ((self.usd_free / max(self.usd_total, 1e-9)) >= self.min_cash_pct_to_buy)
+            else:
+                cash_ok = True
+            if can_trade and cash_ok and volume_surge and (momentum >= entry_thr):
                 self.entry_price = bar['close']
                 self.entry_bar_index = self._bar_index
+                self.entry_peak_price = self.entry_price
                 self._last_trade_bar = self._bar_index
                 return 'buy'
         else:
             held_bars = self._bar_index - (self.entry_bar_index or self._bar_index)
+
+            # Compute PnL using live avg price if provided; else entry price
+            basis = None
+            if self.pos_qty and self.pos_avg_price:
+                basis = self.pos_avg_price
+            elif self.entry_price:
+                basis = self.entry_price
+            pnl = (bar['close'] / basis - 1.0) if basis else 0.0
+
             # STOP-LOSS
-            if bar['close'] <= self.entry_price * (1 - self.stop_loss_pct):
+            if bar['close'] <= (basis or self.entry_price) * (1 - self.stop_loss_pct):
                 self.entry_price = None
                 self.entry_bar_index = None
+                self.entry_peak_price = None
                 self._last_trade_bar = self._bar_index
                 return 'sell'
-            # TAKE-PROFIT
-            if bar['close'] >= self.entry_price * (1 + self.take_profit_pct) and momentum <= 0:
+
+            # Trailing stop: lock profit from peak
+            if self.entry_peak_price and bar['close'] < self.entry_peak_price and self.trailing_stop_pct > 0:
+                drop = 1.0 - (bar['close'] / self.entry_peak_price)
+                if drop >= self.trailing_stop_pct and bar['close'] > (basis or self.entry_price):
+                    self.entry_price = None
+                    self.entry_bar_index = None
+                    self.entry_peak_price = None
+                    self._last_trade_bar = self._bar_index
+                    return 'sell'
+
+            # TAKE-PROFIT using account position basis if available
+            if pnl >= self.take_profit_pct and (self.tp_immediate or momentum <= 0):
                 self.entry_price = None
                 self.entry_bar_index = None
+                self.entry_peak_price = None
                 self._last_trade_bar = self._bar_index
                 return 'sell'
+
             # Normal exit only after min_hold_bars
             if held_bars >= self.min_hold_bars and can_trade and (momentum <= -exit_thr):
                 self.entry_price = None
                 self.entry_bar_index = None
+                self.entry_peak_price = None
                 self._last_trade_bar = self._bar_index
                 return 'sell'
 

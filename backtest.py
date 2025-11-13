@@ -11,8 +11,8 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, "btc_converted"))
 
 from btc_converted.alpha import HybridAlphaConverted  # uses relaxed momentum already
-from horus import fetch_klines as fetch_horus_klines
-from binance import fetch_klines as fetch_binance_klines
+from utils.horus import fetch_klines as fetch_horus_klines
+from utils.binance import fetch_klines as fetch_binance_klines
 
 class SimplePortfolio:
     def __init__(self, cash=100000.0, fee=0.0001, risk_mult=1.0):
@@ -166,21 +166,19 @@ def run_backtest_single(symbol: str,
                         atr_mom_mult: float,
                         min_hold_bars: int,
                         take_profit_pct: float,
+                        trailing_stop_pct: float,
+                        tp_immediate: bool,
                         verbose: bool):
     df = fetch_data(source, symbol, interval, limit, apikey)
-    alpha = HybridAlphaConverted(volume_period=5,
-                                 atr_period=10,
-                                 momentum_period=mom_period,
-                                 volume_multiplier=vol_mult,
-                                 atr_multiplier=atr_mult,
-                                 stop_loss_pct=stop_loss,
-                                 momentum_epsilon=momentum_epsilon,
-                                 entry_epsilon=entry_epsilon,
-                                 exit_epsilon=exit_epsilon,
-                                 cooldown_bars=int(cooldown_bars),
-                                 atr_mom_mult=atr_mom_mult,
-                                 min_hold_bars=min_hold_bars,
-                                 take_profit_pct=take_profit_pct)
+    alpha = HybridAlphaConverted(
+        volume_period=5, atr_period=10, momentum_period=mom_period,
+        volume_multiplier=vol_mult, atr_multiplier=atr_mult,
+        stop_loss_pct=stop_loss, momentum_epsilon=momentum_epsilon,
+        entry_epsilon=entry_epsilon, exit_epsilon=exit_epsilon,
+        cooldown_bars=int(cooldown_bars), atr_mom_mult=atr_mom_mult,
+        min_hold_bars=min_hold_bars, take_profit_pct=take_profit_pct,
+        trailing_stop_pct=trailing_stop_pct, tp_immediate=tp_immediate
+    )
     port = SimplePortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
     times: List[Any] = []
     prices: List[float] = []
@@ -287,6 +285,8 @@ def run_backtest_multi(symbols: List[str],
                        atr_mom_mult: float,
                        min_hold_bars: int,
                        take_profit_pct: float,
+                       trailing_stop_pct: float,
+                       tp_immediate: bool,
                        max_open_symbols: int,          # NEW
                        max_daily_dd_pct: float,        # NEW
                        verbose: bool):
@@ -302,19 +302,15 @@ def run_backtest_multi(symbols: List[str],
 
     # per-symbol alpha
     alphas = {
-        sym: HybridAlphaConverted(volume_period=5,
-                                  atr_period=10,
-                                  momentum_period=mom_period,
-                                  volume_multiplier=vol_mult,
-                                  atr_multiplier=atr_mult,
-                                  stop_loss_pct=stop_loss,
-                                  momentum_epsilon=momentum_epsilon,
-                                  entry_epsilon=entry_epsilon,
-                                  exit_epsilon=exit_epsilon,
-                                  cooldown_bars=int(cooldown_bars),
-                                  atr_mom_mult=atr_mom_mult,
-                                  min_hold_bars=min_hold_bars,
-                                  take_profit_pct=take_profit_pct)
+        sym: HybridAlphaConverted(
+            volume_period=5, atr_period=10, momentum_period=mom_period,
+            volume_multiplier=vol_mult, atr_multiplier=atr_mult,
+            stop_loss_pct=stop_loss, momentum_epsilon=momentum_epsilon,
+            entry_epsilon=entry_epsilon, exit_epsilon=exit_epsilon,
+            cooldown_bars=int(cooldown_bars), atr_mom_mult=atr_mom_mult,
+            min_hold_bars=min_hold_bars, take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct, tp_immediate=tp_immediate
+        )
         for sym in data.keys()
     }
 
@@ -464,6 +460,8 @@ def parse_args():
     p.add_argument("--atr-mom-mult", type=float, default=0.0)
     p.add_argument("--min-hold-bars", type=int, default=2)
     p.add_argument("--take-profit-pct", type=float, default=0.01)
+    p.add_argument("--trailing-stop-pct", type=float, default=0.02)
+    p.add_argument("--tp-immediate", action="store_true")
     p.add_argument("--max-open-symbols", type=int, default=3, help="limit concurrent long positions (multi-asset)")
     p.add_argument("--max-daily-dd-pct", type=float, default=0.05, help="daily drawdown limit; block new buys if exceeded")
     p.add_argument("--verbose", action="store_true")
@@ -494,6 +492,8 @@ def main():
                                atr_mom_mult=args.atr_mom_mult,
                                min_hold_bars=args.min_hold_bars,
                                take_profit_pct=args.take_profit_pct,
+                               trailing_stop_pct=args.trailing_stop_pct,      # NEW
+                               tp_immediate=args.tp_immediate,      # NEW
                                max_open_symbols=args.max_open_symbols,      # NEW
                                max_daily_dd_pct=args.max_daily_dd_pct,      # NEW
                                verbose=args.verbose)
@@ -519,6 +519,8 @@ def main():
                                 atr_mom_mult=args.atr_mom_mult,
                                 min_hold_bars=args.min_hold_bars,
                                 take_profit_pct=args.take_profit_pct,
+                                trailing_stop_pct=args.trailing_stop_pct,      # NEW
+                                tp_immediate=args.tp_immediate,      # NEW
                                 verbose=args.verbose)
     except Exception as e:
         print("Backtest error:", e)

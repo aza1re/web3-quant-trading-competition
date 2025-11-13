@@ -9,8 +9,10 @@ from typing import List, Optional
 # use relative import for alpha inside the package
 from .alpha import HybridAlphaConverted
 
-from binance import fetch_klines as fetch_binance_klines
-from horus import fetch_klines as fetch_horus_klines
+from utils.binance import fetch_klines as fetch_binance_klines
+from utils.horus import fetch_klines as fetch_horus_klines
+from utils.rostoo import RoostooClient, BASE_URL
+import traceback
 
 import argparse
 import time
@@ -19,9 +21,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import json
-from typing import List, Optional
-from rostoo import RoostooClient, BASE_URL
-import traceback
 from datetime import datetime
 import math
 
@@ -365,7 +364,9 @@ def run_live(symbol: str,
              max_open_symbols: int = 1,
              max_daily_dd_pct: float = 0.05,
              debug_signals: bool = False,
-             poll_secs: Optional[int] = None):
+             poll_secs: Optional[int] = None,
+             trailing_stop_pct: float = 0.02,   # NEW
+             tp_immediate: bool = False):       # NEW
     pair = _pair_from_symbol(symbol)
     client = RoostooClient(api_key=apikey, secret_key=apisecret)
     alpha = HybridAlphaConverted(volume_period=5,
@@ -380,7 +381,9 @@ def run_live(symbol: str,
                                  cooldown_bars=cooldown_bars,
                                  atr_mom_mult=atr_mom_mult,
                                  min_hold_bars=min_hold_bars,
-                                 take_profit_pct=take_profit_pct)
+                                 take_profit_pct=take_profit_pct,
+                                 trailing_stop_pct=trailing_stop_pct,  # NEW
+                                 tp_immediate=tp_immediate)            # NEW
 
     # warmup
     try:
@@ -424,6 +427,20 @@ def run_live(symbol: str,
                 _print_raw_resp(resp_s, label="check-sell")
 
     try:
+        # initial account context
+        tickers_once = fetch_roostoo_tickers()
+        prices_map = _prices_map_from_tickers(tickers_once)
+        usd_free, usd_total, _ = _account_snapshot(client, prices_map)
+        # use SimplePortfolio state for position info
+        alpha.set_account_context(usd_free=usd_free, usd_total=usd_total,
+                                  pos_qty=port.positions, pos_avg_price=port.avg_price or None)
+    except Exception:
+        pass
+
+    acct_poll_i = 0
+    acct_poll_every = 10  # refresh account context every N polls
+
+    try:
         while True:
             price = fetch_roostoo_ticker(pair)
             now = pd.to_datetime('now', utc=True)
@@ -431,6 +448,18 @@ def run_live(symbol: str,
                 if verbose: print("[WARN] no price")
                 time.sleep(interval_secs); continue
             prices_now[symbol] = price
+
+            # periodically refresh account context
+            acct_poll_i = (acct_poll_i + 1) % acct_poll_every
+            if acct_poll_i == 0:
+                try:
+                    tickers_map = {pair: price}
+                    usd_free, usd_total, _ = _account_snapshot(client, _prices_map_from_tickers(tickers_map))
+                    alpha.set_account_context(usd_free=usd_free, usd_total=usd_total,
+                                              pos_qty=port.positions, pos_avg_price=port.avg_price or None)
+                except Exception:
+                    pass
+
             closed_bar = agg.update(now, price)
             if closed_bar is None:
                 time.sleep(interval_secs); continue
@@ -564,7 +593,9 @@ def run_live_multi(symbols: List[str],
                    max_open_symbols: int = 3,
                    max_daily_dd_pct: float = 0.05,
                    debug_signals: bool = False,
-                   poll_secs: Optional[int] = None):
+                   poll_secs: Optional[int] = None,
+                   trailing_stop_pct: float = 0.02,  # NEW
+                   tp_immediate: bool = False):      # NEW
     client = RoostooClient(api_key=apikey, secret_key=apisecret)
     alphas = {
         s: HybridAlphaConverted(volume_period=5,
@@ -579,7 +610,9 @@ def run_live_multi(symbols: List[str],
                                 cooldown_bars=cooldown_bars,
                                 atr_mom_mult=atr_mom_mult,
                                 min_hold_bars=min_hold_bars,
-                                take_profit_pct=take_profit_pct)
+                                take_profit_pct=take_profit_pct,
+                                trailing_stop_pct=trailing_stop_pct,  # NEW
+                                tp_immediate=tp_immediate)            # NEW
         for s in symbols
     }
     aggs = {s: BarAggregator(interval) for s in symbols}
@@ -637,6 +670,17 @@ def run_live_multi(symbols: List[str],
                     resp_s = _place_order_safe(client, pairs[s], "SELL", test_qty)
                     print("[CHECK ORDER SELL]", s, _summarize_order_resp(resp_s))
                     _print_raw_resp(resp_s, label=f"check-sell-{s}")
+
+    try:
+        # prime account context once
+        tickers_once = fetch_roostoo_tickers()
+        prices_map = _prices_map_from_tickers(tickers_once)
+        usd_free, usd_total, _ = _account_snapshot(client, prices_map)
+        for s in symbols:
+            alphas[s].set_account_context(usd_free=usd_free, usd_total=usd_total,
+                                          pos_qty=0.0, pos_avg_price=None)
+    except Exception:
+        pass
 
     try:
         while True:
@@ -710,6 +754,23 @@ def run_live_multi(symbols: List[str],
                             resp = _place_order_safe(client, pairs[s], "SELL", rq)
                             print("[ORDER]", s, _summarize_order_resp(resp))
                             _print_raw_resp(resp, label=f"live-sell-{s}")
+
+            # periodically refresh and set account context for each symbol
+            # reuse last_prices as price map to estimate equity cheaply
+            acct_prices_map = { _pair_from_symbol(sym): last_prices.get(sym) for sym in symbols if last_prices.get(sym) is not None }
+            try:
+                usd_free, usd_total, _ = _account_snapshot(client, _prices_map_from_tickers(acct_prices_map))
+            except Exception:
+                usd_free = usd_total = None
+            for sym in symbols:
+                try:
+                    alphas[sym].set_account_context(
+                        usd_free=usd_free, usd_total=usd_total,
+                        pos_qty=port.pos.get(sym, 0.0),
+                        pos_avg_price=port.avgp.get(sym, None)
+                    )
+                except Exception:
+                    pass
 
             if verbose:
                 eq = port.value({k: v for k, v in last_prices.items() if v})
@@ -884,8 +945,10 @@ if __name__ == "__main__":
     parser.add_argument("--atr-mom-mult", type=float, default=0.0)
     parser.add_argument("--min-hold-bars", type=int, default=2)
     parser.add_argument("--take-profit-pct", type=float, default=0.01)
-    parser.add_argument("--max-open-symbols", type=int, default=3)
-    parser.add_argument("--max-daily-dd-pct", type=float, default=0.05)
+    parser.add_argument("--trailing-stop-pct", type=float, default=0.02)  # NEW
+    parser.add_argument("--tp-immediate", action="store_true")             # NEW
+    parser.add_argument("--max-open-symbols", type=int, default=3)         # RESTORED
+    parser.add_argument("--max-daily-dd-pct", type=float, default=0.05)    # RESTORED
     args = parser.parse_args()
 
     print("START main.py", {"argv": sys.argv, "env_DEPLOY": os.environ.get("DEPLOY")}, flush=True)
@@ -897,7 +960,7 @@ if __name__ == "__main__":
                 run_live_multi(syms, args.interval, args.apikey, args.api_secret,
                                args.capital, 0.0001, args.risk_mult, args.allocation,
                                args.verbose, args.force, do_check=args.check,
-                               vol_mult=args.vol_mult, atr_mult=args.atr_mult,  # FIX: use atr_mult not atr_mom_mult
+                               vol_mult=args.vol_mult, atr_mult=args.atr_mult,
                                mom_period=args.mom_period, stop_loss=args.stop_loss,
                                momentum_epsilon=args.momentum_epsilon,
                                entry_epsilon=args.entry_epsilon,
@@ -909,12 +972,14 @@ if __name__ == "__main__":
                                max_open_symbols=args.max_open_symbols,
                                max_daily_dd_pct=args.max_daily_dd_pct,
                                debug_signals=args.debug_signals,
-                               poll_secs=args.poll_secs)
+                               poll_secs=args.poll_secs,
+                               trailing_stop_pct=args.trailing_stop_pct,  # NEW
+                               tp_immediate=args.tp_immediate)            # NEW
             else:
                 run_live(args.symbol or "BTCUSDT", args.interval, args.apikey, args.api_secret,
                          args.capital, 0.0001, args.risk_mult, args.allocation,
                          args.verbose, args.force, do_check=args.check,
-                         vol_mult=args.vol_mult, atr_mult=args.atr_mult,  # FIX here too
+                         vol_mult=args.vol_mult, atr_mult=args.atr_mult,
                          mom_period=args.mom_period, stop_loss=args.stop_loss,
                          momentum_epsilon=args.momentum_epsilon,
                          entry_epsilon=args.entry_epsilon,
@@ -926,7 +991,9 @@ if __name__ == "__main__":
                          max_open_symbols=args.max_open_symbols,
                          max_daily_dd_pct=args.max_daily_dd_pct,
                          debug_signals=args.debug_signals,
-                         poll_secs=args.poll_secs)
+                         poll_secs=args.poll_secs,
+                         trailing_stop_pct=args.trailing_stop_pct,   # NEW
+                         tp_immediate=args.tp_immediate)             # NEW
         else:
             print("Calling run_backtest ...", flush=True)
             run_backtest((args.symbol or "BTCUSDT"), args.interval, args.limit,
