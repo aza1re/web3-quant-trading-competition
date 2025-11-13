@@ -1,4 +1,5 @@
 from collections import deque
+from typing import Optional
 import numpy as np
 
 class HybridAlphaConverted:
@@ -71,8 +72,8 @@ class HybridAlphaConverted:
         self._bar_index = 0
         self._last_trade_bar = -10
 
-    def set_account_context(self, usd_free: float | None = None, usd_total: float | None = None,
-                            pos_qty: float | None = None, pos_avg_price: float | None = None):
+    def set_account_context(self, usd_free: Optional[float] = None, usd_total: Optional[float] = None,
+                            pos_qty: Optional[float] = None, pos_avg_price: Optional[float] = None):
         """Optional live context: lets alpha apply cash gates and PnL-aware exits."""
         try:
             if usd_free is not None: self.usd_free = float(usd_free)

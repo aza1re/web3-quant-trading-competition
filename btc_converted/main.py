@@ -1003,3 +1003,57 @@ if __name__ == "__main__":
         print("UNHANDLED EXCEPTION in main:", str(e), flush=True)
         traceback.print_exc()
         sys.exit(2)
+
+def _prices_map_from_tickers(tickers: dict) -> dict:
+    out = {}
+    for pair, px in (tickers or {}).items():
+        try:
+            out[pair.upper()] = float(px)
+        except Exception:
+            continue
+    return out
+
+def _usd_price(asset: str, prices: dict) -> float:
+    if asset.upper() == "USD":
+        return 1.0
+    return float(prices.get(f"{asset.upper()}/USD", 0.0) or 0.0)
+
+def _extract_balances(resp: dict) -> dict:
+    out = {}
+    if not isinstance(resp, dict):
+        return out
+    wallet_objs = []
+    for k in ["Wallet", "SpotWallet", "MarginWallet"]:
+        w = resp.get(k) or resp.get("Data", {}).get(k)
+        if isinstance(w, dict):
+            wallet_objs.append(w)
+    for w in wallet_objs:
+        for asset, v in w.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                free = float(v.get("Free", 0) or 0)
+                locked = float(v.get("Lock", v.get("Locked", 0) or 0))
+                out[asset.upper()] = {"free": free, "locked": locked, "total": free + locked}
+            except Exception:
+                continue
+    if out:
+        return out
+    for k, v in resp.items():
+        if isinstance(v, (int, float, str)):
+            try:
+                amt = float(v)
+                out[k.upper()] = {"free": amt, "locked": 0.0, "total": amt}
+            except Exception:
+                continue
+    return out
+
+def _account_snapshot(client, prices: dict):
+    bal = client.balance() or {}
+    bmap = _extract_balances(bal)
+    usd_free = float(bmap.get("USD", {}).get("free", 0.0)) if "USD" in bmap else 0.0
+    total = 0.0
+    for asset, v in bmap.items():
+        px = _usd_price(asset, prices)
+        total += v.get("total", 0.0) * (px if px > 0 else (1.0 if asset == "USD" else 0.0))
+    return usd_free, total, bmap
