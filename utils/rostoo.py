@@ -38,21 +38,23 @@ class RoostooClient:
                         total_params.encode('utf-8'),
                         hashlib.sha256).hexdigest()
 
-    def _signed_headers_and_body(self, payload: Dict[str, Any]) -> Tuple[Dict[str, str], str]:
-        # Ensure timestamp included for signed endpoints
-        payload = dict(payload)  # copy
-        if 'timestamp' not in payload:
-            payload['timestamp'] = _ts_ms()
-        total_params = _build_sorted_params(payload)
+    def _signed_headers_and_body(self, payload: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, Any], str]:
+        """
+        Return (headers, payload_dict, total_params_string) for signed endpoints.
+        Previously only returned (headers, total_params) which caused GET requests
+        to pass a raw string as params=..., preventing proper query encoding.
+        """
+        pl = dict(payload)
+        if 'timestamp' not in pl:
+            pl['timestamp'] = _ts_ms()
+        total_params = _build_sorted_params(pl)
         signature = self._sign(total_params)
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if self.api_key:
             headers["RST-API-KEY"] = self.api_key
         if signature:
             headers["MSG-SIGNATURE"] = signature
-        return headers, total_params
+        return headers, pl, total_params
 
     def _symbol_to_pair(self, symbol: str) -> str:
         # Accept BTCUSDT, BTCUSD, BTC or BTC/USD -> convert to BTC/USD
@@ -97,18 +99,18 @@ class RoostooClient:
 
     # Signed endpoints ----------------------------------------------------
     def balance(self) -> Optional[Dict]:
-        headers, body = self._signed_headers_and_body({})
+        headers, payload, _ = self._signed_headers_and_body({})
         try:
-            resp = requests.get(f"{self.base_url}/v3/balance", headers=headers, params=body, timeout=10)
+            resp = requests.get(f"{self.base_url}/v3/balance", headers=headers, params=payload, timeout=10)
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException:
             return None
 
     def pending_count(self) -> Optional[Dict]:
-        headers, body = self._signed_headers_and_body({})
+        headers, payload, _ = self._signed_headers_and_body({})
         try:
-            resp = requests.get(f"{self.base_url}/v3/pending_count", headers=headers, params=body, timeout=10)
+            resp = requests.get(f"{self.base_url}/v3/pending_count", headers=headers, params=payload, timeout=10)
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException:
@@ -152,7 +154,7 @@ class RoostooClient:
         if order_type.upper() == 'LIMIT' and price is not None:
             payload['price'] = str(price)
 
-        headers, total_params = self._signed_headers_and_body(payload)
+        headers, _, total_params = self._signed_headers_and_body(payload)
         try:
             resp = requests.post(f"{self.base_url}/v3/place_order", headers=headers, data=total_params, timeout=15)
             resp.raise_for_status()
@@ -173,7 +175,7 @@ class RoostooClient:
             if pending_only is not None:
                 payload['pending_only'] = 'TRUE' if pending_only else 'FALSE'
 
-        headers, total_params = self._signed_headers_and_body(payload)
+        headers, _, total_params = self._signed_headers_and_body(payload)
         try:
             resp = requests.post(f"{self.base_url}/v3/query_order", headers=headers, data=total_params, timeout=15)
             resp.raise_for_status()
@@ -187,7 +189,7 @@ class RoostooClient:
             payload['order_id'] = str(order_id)
         elif pair:
             payload['pair'] = pair
-        headers, total_params = self._signed_headers_and_body(payload)
+        headers, _, total_params = self._signed_headers_and_body(payload)
         try:
             resp = requests.post(f"{self.base_url}/v3/cancel_order", headers=headers, data=total_params, timeout=15)
             resp.raise_for_status()
