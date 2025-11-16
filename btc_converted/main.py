@@ -361,14 +361,19 @@ def run_live(symbol: str,
              atr_mom_mult: float = 0.0,
              min_hold_bars: int = 2,
              take_profit_pct: float = 0.01,
-             max_open_symbols: int = 1,
+             max_open_symbols: int = 1,          # retained for interface symmetry
              max_daily_dd_pct: float = 0.05,
              debug_signals: bool = False,
              poll_secs: Optional[int] = None,
-             trailing_stop_pct: float = 0.02,   # NEW
-             tp_immediate: bool = False):       # NEW
+             trailing_stop_pct: float = 0.02,
+             tp_immediate: bool = False):
+    """
+    Single-symbol live runner (now mirrors multi logic: real balance-based sells, post-fill reconciliation,
+    portfolio-aware alpha context, daily drawdown filter, TP + trailing stop inside alpha).
+    """
     pair = _pair_from_symbol(symbol)
     client = RoostooClient(api_key=apikey, secret_key=apisecret)
+
     alpha = HybridAlphaConverted(volume_period=5,
                                  atr_period=10,
                                  momentum_period=mom_period,
@@ -382,26 +387,31 @@ def run_live(symbol: str,
                                  atr_mom_mult=atr_mom_mult,
                                  min_hold_bars=min_hold_bars,
                                  take_profit_pct=take_profit_pct,
-                                 trailing_stop_pct=trailing_stop_pct,  # NEW
-                                 tp_immediate=tp_immediate)            # NEW
+                                 trailing_stop_pct=trailing_stop_pct,
+                                 tp_immediate=tp_immediate)
 
-    # warmup
+    # WARMUP (Binance klines)
     try:
         seed_df = fetch_binance_klines(symbol=symbol, interval=interval, limit=50)
         if seed_df is not None and not seed_df.empty:
             for _, r in seed_df.sort_values("open_time").iterrows():
-                alpha.update({'time': r['open_time'], 'open': float(r['open']), 'high': float(r['high']),
-                              'low': float(r['low']), 'close': float(r['close']),
-                              'volume': float(r['volume']) if 'volume' in r and not pd.isna(r['volume']) else 0.0})
-            if verbose: print(f"[WARMUP] seeded {len(seed_df)} bars")
+                alpha.update({
+                    'time': r['open_time'],
+                    'open': float(r['open']),
+                    'high': float(r['high']),
+                    'low': float(r['low']),
+                    'close': float(r['close']),
+                    'volume': float(r['volume']) if 'volume' in r and not pd.isna(r['volume']) else 0.0
+                })
+            if verbose:
+                print(f"[WARMUP] seeded {len(seed_df)} bars")
     except Exception:
         pass
 
     port = SimplePortfolio(cash=capital, fee=fee, risk_mult=risk_mult)
     day_equity_open = {}
-    last_signal = None
     last_order_resp = None
-    prices_now = {}
+    last_signal = None
 
     interval_secs = 86400 if interval == '1d' else 3600 if interval == '1h' else 900
     if poll_secs and poll_secs > 0:
@@ -410,10 +420,10 @@ def run_live(symbol: str,
 
     agg = BarAggregator(interval)
 
+    # Optional connectivity / permission check + min notional validation
     if do_check:
         test_price = fetch_roostoo_ticker(pair)
         if test_price:
-            # choose smallest qty that clears min notional and step
             base_qty = (_min_notional_usd(symbol) * 1.2) / test_price
             test_qty = _ceil_to_step(symbol, base_qty)
             mode = "EXECUTING" if force else "DRY-RUN"
@@ -426,89 +436,159 @@ def run_live(symbol: str,
                 print("[CHECK ORDER SELL]", _summarize_order_resp(resp_s))
                 _print_raw_resp(resp_s, label="check-sell")
 
+    # Initial account context seeding
     try:
-        # initial account context
         tickers_once = fetch_roostoo_tickers()
         prices_map = _prices_map_from_tickers(tickers_once)
         usd_free, usd_total, _ = _account_snapshot(client, prices_map)
-        # use SimplePortfolio state for position info
         alpha.set_account_context(usd_free=usd_free, usd_total=usd_total,
                                   pos_qty=port.positions, pos_avg_price=port.avg_price or None)
     except Exception:
         pass
 
     acct_poll_i = 0
-    acct_poll_every = 10  # refresh account context every N polls
+    acct_poll_every = 10  # refresh account context every N completed bars (poll cycles)
 
     try:
         while True:
             price = fetch_roostoo_ticker(pair)
             now = pd.to_datetime('now', utc=True)
             if price is None:
-                if verbose: print("[WARN] no price")
-                time.sleep(interval_secs); continue
-            prices_now[symbol] = price
+                if verbose:
+                    print("[WARN] no price")
+                time.sleep(interval_secs)
+                continue
 
-            # periodically refresh account context
+            closed_bar = agg.update(now, price)
+            if closed_bar is None:
+                # interim diagnostic (optional)
+                if debug_signals:
+                    print(f"[DBG~] {symbol} t={now} price={price:.6f} mom={alpha.last_momentum:.6f} atr={alpha.last_current_atr:.6f}")
+                time.sleep(interval_secs)
+                continue
+
+            # Refresh account context periodically (using only this pair price)
             acct_poll_i = (acct_poll_i + 1) % acct_poll_every
             if acct_poll_i == 0:
                 try:
-                    tickers_map = {pair: price}
-                    usd_free, usd_total, _ = _account_snapshot(client, _prices_map_from_tickers(tickers_map))
+                    usd_free, usd_total, _ = _account_snapshot(client, {pair: price})
                     alpha.set_account_context(usd_free=usd_free, usd_total=usd_total,
                                               pos_qty=port.positions, pos_avg_price=port.avg_price or None)
                 except Exception:
                     pass
 
-            closed_bar = agg.update(now, price)
-            if closed_bar is None:
-                time.sleep(interval_secs); continue
             sig = alpha.update(closed_bar)
             last_signal = sig
             if debug_signals:
                 print(f"[DBG] {symbol} t={closed_bar['time']} mom={alpha.last_momentum:.6f} atr={alpha.last_current_atr:.6f} sig={sig}")
 
-            # Log signal even if filtered
             if sig in ('buy', 'sell'):
                 print(f"[SIG] {symbol} {sig} at {closed_bar['time']} px={closed_bar['close']:.6f}")
 
+            # Daily DD anchor
+            day_key = now.date()
+            if day_key not in day_equity_open:
+                day_equity_open[day_key] = port.portfolio_value(price)
+
             if sig == 'buy':
-                day_key = now.date()
-                if day_key not in day_equity_open:
-                    day_equity_open[day_key] = port.portfolio_value(price)
                 cur_eq = port.portfolio_value(price)
-                # risk filter
                 if (cur_eq - day_equity_open[day_key]) / day_equity_open[day_key] <= -max_daily_dd_pct:
                     print(f"[FILTER] {symbol} blocked by daily DD ({max_daily_dd_pct:.2%})")
                 else:
-                    prev_pos = port.positions
-                    port.buy_allocation(price, alloc)
-                    raw_qty = port.positions - prev_pos   # incremental
-                    rqty = _round_qty(symbol, raw_qty)
-                    notional = rqty * price
-                    if rqty <= 0:
-                        print(f"[FILTER] {symbol} no cash/qty after sizing")
+                    # Sizing WITHOUT mutating portfolio until order confirmation
+                    pv = port.portfolio_value(price)
+                    target_value = pv * alloc * port.risk_mult
+                    max_afford = port.cash / (1 + port.fee)
+                    trade_value = min(target_value, max_afford)
+                    qty = trade_value / price if trade_value > 0 and price > 0 else 0.0
+                    qty = _round_qty(symbol, qty)
+                    notional = qty * price
+                    if qty <= 0:
+                        print(f"[FILTER] {symbol} no alloc/cash for entry")
                     elif notional < _min_notional_usd(symbol):
-                        print(f"[FILTER] {symbol} notional too small ${notional:.2f} < ${_min_notional_usd(symbol):.2f}")
+                        print(f"[FILTER] {symbol} notional ${notional:.2f} < min ${_min_notional_usd(symbol):.2f}")
                     else:
-                        print(f"[LIVE] BUY {symbol} qty={rqty:.6f} price={price:.2f} total_pos={port.positions:.6f}")
+                        print(f"[LIVE] BUY {symbol} qty={qty:.6f} price={price:.2f}")
                         if force:
-                            resp = _place_order_safe(client, pair, "BUY", rqty)
+                            resp = _place_order_safe(client, pair, "BUY", qty)
                             last_order_resp = resp
                             print("[ORDER]", _summarize_order_resp(resp))
                             _print_raw_resp(resp, label=f"live-buy-{symbol}")
+                            ok = isinstance(resp, dict) and resp.get("Success")
+                            if ok:
+                                cost = qty * price
+                                fee_paid = cost * port.fee
+                                port.cash -= (cost + fee_paid)
+                                prev = port.positions
+                                new_total = prev + qty
+                                if prev <= 0 or port.avg_price is None:
+                                    port.avg_price = price
+                                else:
+                                    port.avg_price = (port.avg_price * prev + cost) / new_total
+                                port.positions = new_total
+                                port.trade_count += 1
+                                port.trade_sizes.append(qty)
+                                port.trade_values.append(cost)
+                                _refresh_portfolio_after_fill(client, port, {symbol: price})
+                            else:
+                                print(f"[WARN] Buy rejected; portfolio unchanged")
+                        else:
+                            # Dry-run simulation
+                            cost = qty * price
+                            fee_paid = cost * port.fee
+                            port.cash -= (cost + fee_paid)
+                            prev = port.positions
+                            new_total = prev + qty
+                            port.avg_price = price if prev <= 0 or port.avg_price is None else (port.avg_price * prev + cost) / new_total
+                            port.positions = new_total
+                            port.trade_count += 1
+                            port.trade_sizes.append(qty)
+                            port.trade_values.append(cost)
+
             elif sig == 'sell' and port.positions > 0:
-                qty = _round_qty(symbol, port.positions)
-                if qty > 0:
-                    port.sell_all(price)
+                # Fetch actual free balance from exchange (base asset)
+                base_asset = pair.split("/")[0]
+                api_qty = _fetch_free_qty(client, base_asset)
+                qty = _round_qty(symbol, min(api_qty, port.positions))
+                if qty <= 0:
+                    print(f"[FILTER] {symbol} api_qty={api_qty:.6f} no sellable balance")
+                else:
                     print(f"[LIVE] SELL {symbol} qty={qty:.6f} price={price:.2f}")
                     if force:
                         resp = _place_order_safe(client, pair, "SELL", qty)
                         last_order_resp = resp
                         print("[ORDER]", _summarize_order_resp(resp))
                         _print_raw_resp(resp, label=f"live-sell-{symbol}")
+                        ok = isinstance(resp, dict) and resp.get("Success")
+                        if ok:
+                            proceeds = qty * price
+                            fee_paid = proceeds * port.fee
+                            port.cash += (proceeds - fee_paid)
+                            port.positions = max(0.0, port.positions - qty)
+                            if port.positions <= 0:
+                                port.avg_price = None
+                            port.trade_count += 1
+                            port.trade_sizes.append(qty)
+                            port.trade_values.append(proceeds)
+                            _refresh_portfolio_after_fill(client, port, {symbol: price})
+                        else:
+                            print("[WARN] Sell rejected; retaining local position")
+                    else:
+                        # Dry-run simulation
+                        proceeds = qty * price
+                        fee_paid = proceeds * port.fee
+                        port.cash += (proceeds - fee_paid)
+                        port.positions = max(0.0, port.positions - qty)
+                        if port.positions <= 0:
+                            port.avg_price = None
+                        port.trade_count += 1
+                        port.trade_sizes.append(qty)
+                        port.trade_values.append(proceeds)
 
-            _print_status(port, pair, last_signal, last_order_resp, verbose)
+            if verbose:
+                print(f"[STATUS {datetime.utcnow()}] symbol={symbol} cash={port.cash:.2f} pos={port.positions:.6f} "
+                      f"avgp={port.avg_price if port.avg_price else 'N/A'} trades={port.trade_count} last_sig={last_signal}")
+
             time.sleep(interval_secs)
     except KeyboardInterrupt:
         print("Stopping single-symbol live.")
@@ -744,16 +824,77 @@ def run_live_multi(symbols: List[str],
                         resp = _place_order_safe(client, pairs[s], "BUY", rqty)
                         print("[ORDER]", s, _summarize_order_resp(resp))
                         _print_raw_resp(resp, label=f"live-buy-{s}")
+                        ok = isinstance(resp, dict) and resp.get("Success")
+                        if ok:
+                            cost = rqty * price
+                            fee = cost * port.fee
+                            port.cash -= (cost + fee)
+                            prev = port.pos.get(s, 0.0)
+                            new_total = prev + rqty
+                            if prev <= 0 or port.avgp.get(s) is None:
+                                port.avgp[s] = price
+                            else:
+                                port.avgp[s] = (port.avgp[s] * prev + cost) / new_total
+                            port.pos[s] = new_total
+                            port.trade_count += 1
+                            port.trade_sizes.append(rqty)
+                            port.trade_values.append(cost)
+                            # NEW: reconcile cash with API after fill
+                            _refresh_portfolio_after_fill(client, port, last_prices)
+                        else:
+                            print(f"[WARN] Buy rejected; position unchanged for {s}")
+                    else:
+                        # dry-run simulation
+                        cost = rqty * price
+                        fee = cost * port.fee
+                        port.cash -= (cost + fee)
+                        prev = port.pos.get(s, 0.0)
+                        new_total = prev + rqty
+                        if prev <= 0 or port.avgp.get(s) is None:
+                            port.avgp[s] = price
+                        else:
+                            port.avgp[s] = (port.avgp[s] * prev + cost) / new_total
+                        port.pos[s] = new_total
+                        port.trade_count += 1
+                        port.trade_sizes.append(rqty)
+                        port.trade_values.append(cost)
                 elif sig == 'sell':
-                    qty = _round_qty(s, port.pos.get(s, 0.0))
+                    # Fetch actual free qty before attempting order
+                    base = pairs[s].split("/")[0]
+                    api_qty = _fetch_free_qty(client, base)
+                    qty = _round_qty(s, api_qty)
                     if qty > 0:
-                        sold = port.sell_all(s, price)
-                        rq = _round_qty(s, sold)
-                        print(f"[LIVE] SELL {s} qty={rq:.6f} price={price:.2f}")
-                        if force and rq > 0:
-                            resp = _place_order_safe(client, pairs[s], "SELL", rq)
+                        print(f"[LIVE] SELL {s} qty={qty:.6f} price={price:.2f}")
+                        if force:
+                            resp = _place_order_safe(client, pairs[s], "SELL", qty)
+                            ok = isinstance(resp, dict) and resp.get("Success")
                             print("[ORDER]", s, _summarize_order_resp(resp))
                             _print_raw_resp(resp, label=f"live-sell-{s}")
+                            if ok:
+                                # Only update portfolio if exchange confirmed
+                                sold_val = qty * price
+                                fee = sold_val * port.fee
+                                port.cash += (sold_val - fee)
+                                port.pos[s] = 0.0
+                                port.avgp.pop(s, None)
+                                port.trade_count += 1
+                                port.trade_sizes.append(qty)
+                                port.trade_values.append(sold_val)
+                                _refresh_portfolio_after_fill(client, port, prices_now)
+                            else:
+                                print(f"[WARN] Sell rejected; keeping local position for {s}")
+                        else:
+                            # Dry-run: simulate
+                            sold_val = qty * price
+                            fee = sold_val * port.fee
+                            port.cash += (sold_val - fee)
+                            port.pos[s] = 0.0
+                            port.avgp.pop(s, None)
+                            port.trade_count += 1
+                            port.trade_sizes.append(qty)
+                            port.trade_values.append(sold_val)
+                    else:
+                        print(f"[FILTER] {s} no free qty to sell (api_qty={api_qty:.6f})")
 
             # periodically refresh and set account context for each symbol
             # reuse last_prices as price map to estimate equity cheaply
@@ -1057,3 +1198,21 @@ def _account_snapshot(client, prices: dict):
         px = _usd_price(asset, prices)
         total += v.get("total", 0.0) * (px if px > 0 else (1.0 if asset == "USD" else 0.0))
     return usd_free, total, bmap
+
+def _fetch_free_qty(client, base_asset: str) -> float:
+    try:
+        bal = client.balance() or {}
+        bmap = _extract_balances(bal)
+        return float(bmap.get(base_asset.upper(), {}).get("free", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+def _refresh_portfolio_after_fill(client, port, prices_now: dict):
+    """Realign local cash with API USD free balance after a confirmed trade."""
+    try:
+        bal = client.balance() or {}
+        bmap = _extract_balances(bal)
+        usd_free = float(bmap.get("USD", {}).get("free", port.cash))
+        port.cash = usd_free
+    except Exception:
+        pass
