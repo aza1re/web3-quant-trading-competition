@@ -425,7 +425,9 @@ def run_live(symbol: str,
         test_price = fetch_roostoo_ticker(pair)
         if test_price:
             base_qty = (_min_notional_usd(symbol) * 1.2) / test_price
-            test_qty = _ceil_to_step(symbol, base_qty)
+            test_qty = _round_qty(symbol, base_qty)
+            if test_qty * test_price < _min_notional_usd(symbol):
+                test_qty = _round_qty(symbol, (_min_notional_usd(symbol) * 1.1) / test_price)
             mode = "EXECUTING" if force else "DRY-RUN"
             print(f"[CHECK] {mode} test BUY qty={test_qty:.6f} price={test_price:.2f}")
             if force and test_qty > 0:
@@ -740,7 +742,9 @@ def run_live_multi(symbols: List[str],
             p = tickers.get(pairs[s])
             if p:
                 base_qty = (_min_notional_usd(s) * 1.2) / p
-                test_qty = _ceil_to_step(s, base_qty)
+                test_qty = _round_qty(s, base_qty)
+                if test_qty * p < _min_notional_usd(s):
+                    test_qty = _round_qty(s, (_min_notional_usd(s) * 1.1) / p)
                 mode = "EXECUTING" if force else "DRY-RUN"
                 print(f"[CHECK] {mode} {s} test BUY qty={test_qty:.6f} price={p:.2f}")
                 if force and test_qty > 0:
@@ -972,18 +976,20 @@ def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET',
 
 # --- Exchange sizing helpers (step sizes + min notional) ---
 _STEP_SIZE = {
-    # symbols
     "ETHUSDT": 0.001,
-    "TRXUSDT": 1.0,    # set to 0.1 if your venue allows fractional TRX
-    # pairs
+    "TRXUSDT": 1.0,
+    "BTCUSDT": 0.0001,      # adjust to 0.00001 if venue supports finer precision
     "ETH/USD": 0.001,
     "TRX/USD": 1.0,
+    "BTC/USD": 0.0001,
 }
 _MIN_NOTIONAL = {
     "ETHUSDT": 10.0,
     "TRXUSDT": 10.0,
+    "BTCUSDT": 10.0,
     "ETH/USD": 10.0,
     "TRX/USD": 10.0,
+    "BTC/USD": 10.0,
 }
 
 def _qty_step(symbol_or_pair: str) -> float:
