@@ -974,6 +974,18 @@ def _place_order_safe(client, pair_or_coin, side, quantity, order_type='MARKET',
         raise last_exc
     raise RuntimeError("Unable to call client.place_order with tested signatures")
 
+# Ensure portfolio reconciliation helper is available early (fix NameError seen in run_live_multi)
+def _refresh_portfolio_after_fill(client, port, prices_now: dict):
+    """Realign local cash with API USD free balance after a confirmed trade."""
+    try:
+        bal = client.balance() or {}
+        # reuse same extractor that's defined later; _extract_balances exists in module scope
+        bmap = _extract_balances(bal)
+        usd_free = float(bmap.get("USD", {}).get("free", port.cash))
+        port.cash = usd_free
+    except Exception:
+        pass
+
 # --- Exchange sizing helpers (step sizes + min notional) ---
 _STEP_SIZE = {
     "ETHUSDT": 0.001,
@@ -1212,13 +1224,3 @@ def _fetch_free_qty(client, base_asset: str) -> float:
         return float(bmap.get(base_asset.upper(), {}).get("free", 0.0) or 0.0)
     except Exception:
         return 0.0
-
-def _refresh_portfolio_after_fill(client, port, prices_now: dict):
-    """Realign local cash with API USD free balance after a confirmed trade."""
-    try:
-        bal = client.balance() or {}
-        bmap = _extract_balances(bal)
-        usd_free = float(bmap.get("USD", {}).get("free", port.cash))
-        port.cash = usd_free
-    except Exception:
-        pass
