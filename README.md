@@ -18,7 +18,7 @@ This repository implements a momentum and volatility breakout trading bot for th
 
 All strategy parameters (volume multiplier, ATR multiplier, momentum thresholds, stop-loss, take-profit, etc.) were configured in run/btc.sh with environment variables in the AWS instance.
 
-## Backtesting workflow (corrected)
+## Backtesting workflow
 
 We originally backtested the strategy using Binance historical OHLCV because Binance provides full OHLCV (open/high/low/close/volume) data and the strategy uses a volume‑surge filter. After preparing for live deployment on Roostoo, we discovered an important mismatch:
 
